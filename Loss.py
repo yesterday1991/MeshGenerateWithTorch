@@ -2,10 +2,10 @@
 import torch
 from OCC.Core.gp import gp_Pnt
 import torch.nn as nn
-from MyGeometry import ProjectMeshVertToGeo
+from MyGeometry import project_mesh_vert_to_geo
 
 
-def MatchPnt2Mesh(src_mesh, pnt, had_match):
+def match_pnt_to_mesh(src_mesh, pnt, had_match):
     """
     以最短距离为标准匹配pnt在网格中对应的网格节点
     :param src_mesh:        网格
@@ -30,7 +30,7 @@ def MatchPnt2Mesh(src_mesh, pnt, had_match):
     return min_indx
 
 
-def MatchSampleGeoWithMesh(src_mesh, geo, had_matched_indx, geo_flag):
+def match_sample_geo_with_mesh(src_mesh, geo, had_matched_indx, geo_flag):
     """
     将geo中采样点与src_mesh网格中网格点按顶点，边，面顺序按最短距离进行匹配
     :param src_mesh:            网格
@@ -51,7 +51,7 @@ def MatchSampleGeoWithMesh(src_mesh, geo, had_matched_indx, geo_flag):
         matched = geo.important_sample_pnt
     matched = matched.tolist()
     for j in matched:
-        current_match = MatchPnt2Mesh(src_mesh, j, had_matched_indx)  # 匹配
+        current_match = match_pnt_to_mesh(src_mesh, j, had_matched_indx)  # 匹配
         sample_total.append(j)
         had_matched_indx = torch.cat((had_matched_indx, torch.tensor([current_match], dtype=torch.int)))
         match_indx = torch.cat((match_indx, torch.tensor([current_match], dtype=torch.int)))
@@ -64,7 +64,7 @@ def MatchSampleGeoWithMesh(src_mesh, geo, had_matched_indx, geo_flag):
 
 
 
-def GeoMatchloss(trg_mesh, src_geo):
+def geo_match_loss(trg_mesh, src_geo):
     """
     计算几何边的匹配损失，用于处理几何边界
     :param trg_mesh:    网格
@@ -73,14 +73,14 @@ def GeoMatchloss(trg_mesh, src_geo):
     """
     mesh_verts = trg_mesh.verts_packed()
     had_matched = torch.tensor([], dtype=torch.int)
-    matched_pnt_tensor, current_matched = MatchSampleGeoWithMesh(trg_mesh, src_geo, had_matched, 3)
+    matched_pnt_tensor, current_matched = match_sample_geo_with_mesh(trg_mesh, src_geo, had_matched, 3)
     match_verts_tensor = mesh_verts[current_matched]
     mseloss = nn.MSELoss()
     mean_loss = mseloss(match_verts_tensor, matched_pnt_tensor)
     return mean_loss
 
 
-def GeoProjSurfaceLoss(trg_mesh, src_geo):
+def geo_proj_surface_loss(trg_mesh, src_geo):
     """
     以投影为计算方法，得到网格点到面的距离损失计算
     :param trg_mesh:    网格实例
@@ -89,13 +89,13 @@ def GeoProjSurfaceLoss(trg_mesh, src_geo):
     """
     verts = trg_mesh.verts_packed()
     # 找到网格顶点对应投影点位置
-    tensor_pnts = torch.Tensor(ProjectMeshVertToGeo(verts, src_geo))
+    tensor_pnts = torch.Tensor(project_mesh_vert_to_geo(verts, src_geo))
     # 网格点与投影点计算损失
     loss = nn.MSELoss()
     mean_loss = loss(verts, tensor_pnts)
     return mean_loss
 
-def CountMeshAngle(mesh):
+def count_mesh_angle(mesh):
     """
     计算网格内所有角度
     :param mesh:    网格
@@ -117,14 +117,14 @@ def CountMeshAngle(mesh):
     return A, B, C
 
 
-def MeshAngleLoss(mesh, angle):
+def mesh_angle_loss(mesh, angle):
     """
     计算网格的角度损失
     :param mesh:    网格
     :param angle:   最优角度
     :return:        损失
     """
-    angle_A, angle_B, angle_C = CountMeshAngle(mesh)
+    angle_A, angle_B, angle_C = count_mesh_angle(mesh)
     loss = nn.MSELoss()
     target_angle = torch.full(angle_A.shape, angle)
     loss_mean = (loss(angle_A, target_angle) + loss(angle_B, target_angle) + loss(angle_C, target_angle)) / 3

@@ -22,7 +22,8 @@ import math
 
 geo_eps = 1e-4
 
-def PntInPolygon(u, v, polygon):
+
+def pnt_in_polygon(u, v, polygon):
     """
     射线法判断
     :param u:   二维坐标u
@@ -37,12 +38,13 @@ def PntInPolygon(u, v, polygon):
         slope = (b[1] - a[1]) / (b[0] - a[0])
         cond1 = (a[0] <= u) and (u < b[0])
         cond2 = (b[0] <= u) and (u < a[0])
-        above = v < slope * (u -a[0]) + a[1]
+        above = v < slope * (u - a[0]) + a[1]
         if (cond1 or cond2) and above:
             crossing += 1
     return (crossing % 2 != 0)
 
-def GetEdgeLength(topo_edge):
+
+def get_edge_length(topo_edge):
     """
     计算边长度
     :param topo_edge:  OCC拓扑边
@@ -53,7 +55,8 @@ def GetEdgeLength(topo_edge):
     crv_length = cgprop.Mass()
     return crv_length
 
-def GetSufacesArea(topo_face):
+
+def get_sufaces_area(topo_face):
     """
     计算所有几何面面积
     :return: 面积
@@ -64,7 +67,7 @@ def GetSufacesArea(topo_face):
     return abs(surface_area)
 
 
-def AngleABCInCurve(dim, curve, first, mid, last):
+def angle_in_curve(dim, curve, first, mid, last):
     """
     计算给定曲线上 first, mid last 三个参数坐标构成折线段角度的cos值
     :param dim:     curve的维度(二维或三维)
@@ -80,7 +83,7 @@ def AngleABCInCurve(dim, curve, first, mid, last):
     c = curve.Value(last)
     # 计算起点终点长度
     distance = a.Distance(c)
-    if distance < 0.01:       #长度过小，不进行插值
+    if distance < 0.01:  #长度过小，不进行插值
         return 1
     if dim == 2:
         a_xy = np.array([a.X(), a.Y()])
@@ -102,7 +105,71 @@ def AngleABCInCurve(dim, curve, first, mid, last):
     return np.dot(vector_ba, vector_cb) / (len_ba * len_cb)
 
 
-def DiscreteWire(wire, face):
+def discrete_curve(curve, first, last, orientation):
+    """
+    离散曲线curve
+    :param curve:   OCC中的曲线
+    :param first:   曲线的起始参数坐标
+    :param last:    曲线的终止参数坐标
+    :param orientation      curve对应的edge的方向
+    :return:        np离散点xyz,   [[x1,y1,z1], [x2,y2,z2],.....]
+                    np离散点参数坐标[t1,t2,..]
+    """
+    # 计算离散点
+    isclosed = False
+    pnt1 = curve.Value(first)
+    pnt2 = curve.Value(last)
+    if pnt1.IsEqual(pnt2, geo_eps):
+        isclosed = True
+    if isclosed:
+        # 闭合曲线取5个点为初始点
+        tmp_total = first + last
+        tmp_1d5 = first + tmp_total / 5
+        tmp_2d5 = first + tmp_total / 5 * 2
+        tmp_3d5 = first + tmp_total / 5 * 3
+        tmp_4d5 = first + tmp_total / 5 * 4
+        subdivide_array = np.array([first, tmp_1d5, tmp_2d5, tmp_3d5, tmp_4d5, last])
+    else:
+        subdivide_array = np.array([first, last])
+    # 开始离散
+    subdivide_flag = True
+    while subdivide_flag:
+        subdivide_array_len = len(subdivide_array)
+        subdivide_flag = False  # 默认不会发生插值
+        for i in range(subdivide_array_len - 1):
+            tmp_first = subdivide_array[i]
+            tmp_last = subdivide_array[i + 1]
+            tmp_mid = (tmp_first + tmp_last) / 2
+            angle = angle_in_curve(3, curve, tmp_first, tmp_mid, tmp_last)
+            if angle < 0.95:  # 不是直线，中点加入数组
+                subdivide_array = np.append(subdivide_array, tmp_mid)  # 插入的值放在数组最后，不影响前面计算
+                subdivide_flag = True
+            subdivide_array.sort()  # 对插入值后的数组进行排序
+    # 边方向与几何方向相反，进行翻转
+    if orientation:
+        subdivide_array = np.flip(subdivide_array)
+    # 将参数坐标转换成gp_pnt
+    pnt_list = []
+    for t in subdivide_array:
+        gp_point = curve.Value(t)
+        pnt_list.append(gp_point)
+    # 去除距离过小的点
+    for i in range(len(pnt_list) - 1, 1, -1):
+        pnt1 = pnt_list[i]
+        pnt2 = pnt_list[i - 1]
+        distance = pnt1.Distance(pnt2)
+        if distance < 0.005:
+            pnt_list.pop(i)
+            subdivide_array = np.delete(subdivide_array, i)
+    # 将gp_pnt转换成xyzlist
+    pnts_xyz = []
+    for i in pnt_list:
+        point_xyz = [i.X(), i.Y(), i.Z()]
+        pnts_xyz.append(point_xyz)
+    return np.array(pnts_xyz), subdivide_array
+
+
+def discrete_Wire(wire, face):
     """
     离散surface上的环wire
     :param wire:        occ中的环
@@ -115,8 +182,8 @@ def DiscreteWire(wire, face):
     surface = BRep_Tool.Surface(face)
     while exp_edge.More():
         is_closed = False
-        edge = exp_edge.Current()                                       # 当前拓扑参数曲线
-        curve2d_inf = BRep_Tool.CurveOnSurface(edge, face)           # 参数曲线信息
+        edge = exp_edge.Current()  # 当前拓扑参数曲线
+        curve2d_inf = BRep_Tool.CurveOnSurface(edge, face)  # 参数曲线信息
         curve2d = curve2d_inf[0]
         pnt_2d1 = curve2d.Value(curve2d_inf[1])
         pnt_2d2 = curve2d.Value(curve2d_inf[2])
@@ -131,26 +198,26 @@ def DiscreteWire(wire, face):
             tmp_2d5 = curve2d_inf[1] + tmp_total / 5 * 2
             tmp_3d5 = curve2d_inf[1] + tmp_total / 5 * 3
             tmp_4d5 = curve2d_inf[1] + tmp_total / 5 * 4
-            subdivide_array = np.array([curve2d_inf[1], tmp_1d5, tmp_2d5, tmp_3d5, tmp_4d5,curve2d_inf[2]])
+            subdivide_array = np.array([curve2d_inf[1], tmp_1d5, tmp_2d5, tmp_3d5, tmp_4d5, curve2d_inf[2]])
         else:
-            subdivide_array = np.array([curve2d_inf[1], curve2d_inf[2]])    # 离散点二维坐标
+            subdivide_array = np.array([curve2d_inf[1], curve2d_inf[2]])  # 离散点二维坐标
         subdivide_flag = True
         while subdivide_flag:
             subdivide_array_len = len(subdivide_array)
-            subdivide_flag = False                                      # 默认不会发生插值
+            subdivide_flag = False  # 默认不会发生插值
             for i in range(subdivide_array_len - 1):
                 first = subdivide_array[i]
-                last = subdivide_array[i+1]
+                last = subdivide_array[i + 1]
                 mid = (first + last) / 2
-                angle = AngleABCInCurve(2, curve2d, first, mid, last)
-                if angle < 0.99:            # 不是直线，中点加入数组
-                    subdivide_array = np.append(subdivide_array, mid)   # 插入的值放在数组最后，不影响前面计算
-                    subdivide_flag = True                               # 发生了插值，此时还需要进行下一轮检测
-            subdivide_array.sort()                                      # 对插入值后的数组进行排序
-        if edge.Orientation():                                          # 边方向与几何方向相反，进行翻转
+                angle = angle_in_curve(2, curve2d, first, mid, last)
+                if angle < 0.99:  # 不是直线，中点加入数组
+                    subdivide_array = np.append(subdivide_array, mid)  # 插入的值放在数组最后，不影响前面计算
+                    subdivide_flag = True  # 发生了插值，此时还需要进行下一轮检测
+            subdivide_array.sort()  # 对插入值后的数组进行排序
+        if edge.Orientation():  # 边方向与几何方向相反，进行翻转
             subdivide_array = np.flip(subdivide_array)
         for t in subdivide_array:
-            pnt_uv = curve2d.Value(t)                                   # 计算参数坐标值
+            pnt_uv = curve2d.Value(t)  # 计算参数坐标值
             if wire_pnt:
                 if not pnt_uv.IsEqual(wire_pnt[-1], geo_eps):
                     wire_pnt.append(pnt_uv)
@@ -158,9 +225,9 @@ def DiscreteWire(wire, face):
                 wire_pnt.append(pnt_uv)
         exp_edge.Next()
     # 去除距离过小的点，会导致计算可能出现平行情况影响环内外判断
-    for i in range(len(wire_pnt)-1, 1, -1):
+    for i in range(len(wire_pnt) - 1, 1, -1):
         pnt1 = wire_pnt[i]
-        pnt2 = wire_pnt[i-1]
+        pnt2 = wire_pnt[i - 1]
         dist = pnt1.Distance(pnt2)
         if dist < 0.005:
             wire_pnt.pop(i)
@@ -170,6 +237,7 @@ def DiscreteWire(wire, face):
         point_uv = [i.X(), i.Y()]
         wire_pnt_uv.append(point_uv)
     return wire_pnt_uv
+
 
 def pnt_face_box_distance(pnt, face):
     """
@@ -185,7 +253,65 @@ def pnt_face_box_distance(pnt, face):
     box_dist = bbox.Distance(bnd_box_pnt)
     return box_dist
 
-def ProjectToCurve(pnt, value):
+
+def project_to_line(p1, p2, base):
+    """
+    直线投影
+    :param p1: 起点坐标xyz
+    :param p2: 终点坐标xyz
+    :param base: 投影点xyz
+    :return: 投影结果xyz, 在直线上的参数坐标dt
+    """
+    np_p1 = np.array(p1)
+    np_p2 = np.array(p2)
+    np_base = np.array(base)
+    v1 = np_p2 - np_p1
+    v2 = np_base - np_p1
+    l1 = np.dot(v1, v1)
+    l2 = np.dot(v2, v1)
+    if l2 > l1:
+        return p2, 1
+    elif l2 < 0 or l1 == 0:
+        return p1, 0
+    else:
+        dt = l2 / l1
+        proj = dt * l1 + p1
+        return proj.tolist(), dt
+
+
+def coordinate_descent_projection(pnt, initial_t, value, max_iter=100, tol=1e-4):
+    """
+    坐标下降法求解点到曲线曲线投影
+    @param pnt:
+    @param initial_t:
+    @param value:
+    @param max_iter:
+    @param tol:
+    @return:
+    """
+    t = initial_t           # 迭代初值
+    step_size = 0.005       # 步长大小
+    tmp_pnt1 = pnt
+    # 曲线范围
+    first = value.first
+    last = value.last
+    # 坐标下降法优化投影点
+    for i in range(max_iter):
+        tmp_pnt1 = value.curve.Value(t)
+        current_dist1 = pnt.Distance(tmp_pnt1)
+        tmp_pnt2 = value.curve.Value(t + step_size)
+        current_dist2 = pnt.Distance(tmp_pnt2)
+        # 逐步调整 t 来最小化目标函数
+        t_new = t - step_size * (current_dist2 - current_dist1)
+        # 检查收敛性
+        if np.abs(t_new - t) < tol or t_new < first or t_new > last:
+            return tmp_pnt1, t
+
+        t = t_new
+    return tmp_pnt1, t
+
+
+def project_to_curve(pnt, value):
     """
     将点投影到线上
     :param pnt:     gp_pnt 点
@@ -193,32 +319,50 @@ def ProjectToCurve(pnt, value):
     :return:        dist距离, proj_point投影点, curve_t投影点在线上的参数坐标
     """
     proj2edge = GeomAPI_ProjectPointOnCurve()  # 点到线投影函数
-    topo_edge = value.edge
-    # 边不是退化情况才有意义
-    curve3d = value.curve
-    first = value.first
-    last = value.last
-    proj2edge.Init(pnt, curve3d)  # 初始化OCC投影函数
-    dist = proj2edge.LowerDistance()
-    curve_t = proj2edge.LowerDistanceParameter()  # 投影点在曲线上参数坐标 t
-    proj_point = proj2edge.NearestPoint()
-    if curve_t > last - geo_eps or curve_t < first + geo_eps:  # 投影点不在定义域内
-        pnt1 = curve3d.Value(first)
-        pnt2 = curve3d.Value(last)
-        dist1 = pnt.Distance(pnt1)
-        dist2 = pnt.Distance(pnt2)
-        if dist1 < dist2:  # 比较网格点到两个端点的距离
-            dist = dist1
-            proj_point = pnt1
-            curve_t = first
-        else:
-            dist = dist2
-            proj_point = pnt2
-            curve_t = last
+    try:
+        curve3d = value.curve
+        first = value.first
+        last = value.last
+        proj2edge.Init(pnt, curve3d)  # 初始化OCC投影函数
+        dist = proj2edge.LowerDistance()
+        curve_t = proj2edge.LowerDistanceParameter()  # 投影点在曲线上参数坐标 t
+        proj_point = proj2edge.NearestPoint()
+        if curve_t > last - geo_eps or curve_t < first + geo_eps:  # 投影点不在定义域内
+            pnt1 = curve3d.Value(first)
+            pnt2 = curve3d.Value(last)
+            dist1 = pnt.Distance(pnt1)
+            dist2 = pnt.Distance(pnt2)
+            if dist1 < dist2:  # 比较网格点到两个端点的距离
+                dist = dist1
+                proj_point = pnt1
+                curve_t = first
+            else:
+                dist = dist2
+                proj_point = pnt2
+                curve_t = last
+    except RuntimeError:  # OCC投影失败
+        loc_dis_curve = value.discrete_curve  # 曲线简易离散形式
+        loc_dis_curve_dt = value.discrete_curve_dt
+        base = [pnt.X(), pnt.Y(), pnt.Z()]
+        min_dist = float("inf")
+        for k in range(len(loc_dis_curve) - 1):
+            p1 = loc_dis_curve[k]
+            p2 = loc_dis_curve[k + 1]
+            # 投影到离散曲线上计算估值
+            proj_tmp_xyz, dt_loc = project_to_line(p1, p2, base)
+            proj_point_tmp = gp_Pnt(proj_tmp_xyz[0], proj_tmp_xyz[1], proj_tmp_xyz[2])
+            dist_tmp = pnt.Distance(proj_point_tmp)
+            if dist_tmp < min_dist:
+                # 迭代法计算精确值
+                curve_t = dt_loc * (loc_dis_curve_dt[k + 1] - loc_dis_curve_dt[k]) + loc_dis_curve_dt[k]
+                proj_tmp, new_curve_t = coordinate_descent_projection(pnt, curve_t, value)
+                dist = dist_tmp
+                proj_point = proj_tmp
+                curve_t = new_curve_t
     return dist, proj_point, curve_t
 
 
-def ProjectToface(pnt, value, geo):
+def project_to_face(pnt, value, geo):
     """
     点投影到裁剪曲面上
     :param pnt:     点
@@ -226,42 +370,42 @@ def ProjectToface(pnt, value, geo):
     :param geo:     几何
     :return:        距离， 投影点坐标
     """
-    proj2face = GeomAPI_ProjectPointOnSurf()        # 点到面投影函数
+    proj2face = GeomAPI_ProjectPointOnSurf()  # 点到面投影函数
     srf = value.surface
-    proj2face.Init(pnt, srf, geo_eps)                   # 初始化投影函数
-    dist = proj2face.LowerDistance()                # 点与投影点距离
+    proj2face.Init(pnt, srf, geo_eps)  # 初始化投影函数
+    dist = proj2face.LowerDistance()  # 点与投影点距离
     # 检查uv合法性
-    u, v = proj2face.LowerDistanceParameters()      # 投影点在曲面上的uv坐标
-    is_legal = True                                 # 默认认为uv在裁剪曲面内部
-    wire_num = value.wire_num                       # 面wire数量
-    wire_point = value.wire_discrete_point          # 二维wire离散点
+    u, v = proj2face.LowerDistanceParameters()  # 投影点在曲面上的uv坐标
+    is_legal = True  # 默认认为uv在裁剪曲面内部
+    wire_num = value.wire_num  # 面wire数量
+    wire_point = value.wire_discrete_point  # 二维wire离散点
     # 在读入几何时将将外环放在wire_point[0]中，只要保证uv点在外环内，在内环外即可，两者方向相反
     # 先检查pnt与外环的关系
     outwire = wire_point[0]
-    if not PntInPolygon(u, v, outwire):
+    if not pnt_in_polygon(u, v, outwire):
         is_legal = False
     if wire_num > 2:  # 继续检查内环
         for m in range(1, wire_num):
             current_wire = wire_point[m]
-            if PntInPolygon(u, v, current_wire):
+            if pnt_in_polygon(u, v, current_wire):
                 is_legal = False
-    if is_legal:                                # uv点在裁剪区域内，为合法投影
-        proj_point = proj2face.NearestPoint()   # 投影点
+    if is_legal:  # uv点在裁剪区域内，为合法投影
+        proj_point = proj2face.NearestPoint()  # 投影点
         current_proj_xyz = [proj_point.X(), proj_point.Y(), proj_point.Z()]
         return dist, current_proj_xyz
-    else:                                                   # uv点在裁剪区域外，非法区域，重新投影
+    else:  # uv点在裁剪区域外，非法区域，重新投影
         edge_in_face = value.contain_edge_index
         proj_edge_min = float("inf")
         for key in edge_in_face:
             edge = geo.edges[key]
-            dist, proj_point, curve_t = ProjectToCurve(pnt, edge)
+            dist, proj_point, curve_t = project_to_curve(pnt, edge)
             if dist != -1 and dist < proj_edge_min:
                 proj_edge_min = dist
                 current_proj_xyz = [proj_point.X(), proj_point.Y(), proj_point.Z()]
         return proj_edge_min, current_proj_xyz
 
 
-def ProjectMeshVertToGeo(verts, geo):
+def project_mesh_vert_to_geo(verts, geo):
     """
     将网格点投影到距离最近的几何面
     :param verts:           网格顶点坐标 tensor (sum(V_n), 3)
@@ -269,23 +413,23 @@ def ProjectMeshVertToGeo(verts, geo):
     :param plot_flag:       是否更改投影所属
     :return:                返回投影点坐标     tensor (sum(V_n), 3)
     """
-    verts_num = verts.shape[0]                                              # 网格顶点数量
-    proj_point_xyz = []                                         # 投影后的坐标集合
+    verts_num = verts.shape[0]  # 网格顶点数量
+    proj_point_xyz = []  # 投影后的坐标集合
     for j in range(verts_num):
         if math.isnan(verts[j][0].item()) or math.isnan(verts[j][1].item()) or math.isnan(verts[j][2].item()):
             print("出现nan")
         projection_pnt = gp_Pnt(verts[j][0].item(), verts[j][1].item(), verts[j][2].item())  # 坐标初始化OCC_pnt
-        projection_min_dist = float("inf")                                 # 初始化该点到几何的最短距离
-        current_proj_xyz = []                                   # 初始化投影点坐标
+        projection_min_dist = float("inf")  # 初始化该点到几何的最短距离
+        current_proj_xyz = []  # 初始化投影点坐标
 
         # 计算点到每个面的投影距离
         for _, value in geo.faces.items():
-            face = value.face                                 # 拓扑面
+            face = value.face  # 拓扑面
             # 利用拓扑面构建bnd_box,利用box之间的距离排除该面
             box_dist = pnt_face_box_distance(projection_pnt, face)
-            if box_dist > projection_min_dist:         # box之间的最小值都大于投影距离，投影点肯定不在该面上
+            if box_dist > projection_min_dist:  # box之间的最小值都大于投影距离，投影点肯定不在该面上
                 continue
-            dist, proj_point = ProjectToface(projection_pnt, value, geo)
+            dist, proj_point = project_to_face(projection_pnt, value, geo)
             if dist < projection_min_dist:
                 projection_min_dist = dist
                 current_proj_xyz = proj_point.copy()
@@ -294,10 +438,12 @@ def ProjectMeshVertToGeo(verts, geo):
         proj_point_xyz.append(current_proj_xyz)  # 记录全局最近坐标
     return proj_point_xyz
 
+
 class MyVertex:
     """
     点类
     """
+
     def __init__(self, index, vert):
         self.index = index
         self.vert = vert
@@ -315,6 +461,7 @@ class MyEdge:
     """
     边类
     """
+
     def __init__(self, index, edge, map_vert):
         self.index = index
         self.edge = edge
@@ -326,10 +473,10 @@ class MyEdge:
         v1 = TopoDS_Vertex()
         v2 = TopoDS_Vertex()
         topexp.Vertices(edge, v1, v2)
-        num1 = map_vert.Find(v1)                            # 点1编号
-        num2 = map_vert.Find(v2)                            # 点2编号
-        v1_pnt = BRep_Tool.Pnt(v1)                          # 拓扑起点位置
-        first_pnt = self.curve.Value(self.first)            # 实际起点位置
+        num1 = map_vert.Find(v1)  # 点1编号
+        num2 = map_vert.Find(v2)  # 点2编号
+        v1_pnt = BRep_Tool.Pnt(v1)  # 拓扑起点位置
+        first_pnt = self.curve.Value(self.first)  # 实际起点位置
         self.end_pnt_index = []
         if first_pnt.IsEqual(v1_pnt, 0.001):
             self.end_pnt_index.append(num1)
@@ -337,11 +484,14 @@ class MyEdge:
         else:
             self.end_pnt_index.append(num2)
             self.end_pnt_index.append(num1)
+        self.discrete_curve, self.discrete_curve_dt = discrete_curve(self.curve, self.first, self.last, self.orientation)
+
 
 class MyFace:
     """
     面类
     """
+
     def __init__(self, index, face, map_edge):
         self.index = index
         self.face = face
@@ -362,16 +512,17 @@ class MyFace:
         self.wire_num = 1
         self.wire_discrete_point = []
         exp_wire = TopExp_Explorer(face, TopAbs_WIRE)
-        out_wire = shapeanalysis.OuterWire(face)                    # 外环
-        out_wire_uv = DiscreteWire(out_wire, face)                  # 离散外环
-        self.wire_discrete_point.append(out_wire_uv)                # 储存离散外环
+        out_wire = shapeanalysis.OuterWire(face)  # 外环
+        out_wire_uv = discrete_Wire(out_wire, face)  # 离散外环
+        self.wire_discrete_point.append(out_wire_uv)  # 储存离散外环
         while exp_wire.More():
             tmp_wire = topods.Wire(exp_wire.Current())
             if not tmp_wire.IsSame(out_wire):
-                inside_wire_uv = DiscreteWire(tmp_wire, face)  # 内环外环
+                inside_wire_uv = discrete_Wire(tmp_wire, face)  # 内环外环
                 self.wire_num += 1
                 self.wire_discrete_point.append(inside_wire_uv)
             exp_wire.Next()
+
 
 class OccGeo:
     def __init__(self, name, vert_num):
@@ -383,16 +534,16 @@ class OccGeo:
         self.max_indx_edge = 0
         self.max_indx_face = 0
 
-        self.int_map_vert = TopTools_DataMapOfShapeInteger()        # 点编号
-        self.vertexs = {}           # 顶点
-        self.num_vertex = 0         # 点数量
+        self.int_map_vert = TopTools_DataMapOfShapeInteger()  # 点编号
+        self.vertexs = {}  # 顶点
+        self.num_vertex = 0  # 点数量
 
-        self.int_map_edge = TopTools_DataMapOfShapeInteger()    # 边编号
+        self.int_map_edge = TopTools_DataMapOfShapeInteger()  # 边编号
         self.edges = {}  # 拓扑边
         self.num_edge = 0  # 边数量
 
-        self.faces = {}            # 拓扑面
-        self.num_face = 0           # 面数量
+        self.faces = {}  # 拓扑面
+        self.num_face = 0  # 面数量
 
         # 获取偏移量与缩放尺寸
         self.GetOffset()
@@ -406,9 +557,9 @@ class OccGeo:
 
         # 按照网格数量计算采样点
         self.MeshNumInEachEdge(vert_num)
-        self.plot_sample = self.GetAllPntXYZ()                          # 画图
-        self.match_sample_vert = self.GetAllPntXYZ()                    # 点匹配
-        self.important_sample_pnt = self.GetAllPntXYZ()                 # 点与边集合匹配
+        self.plot_sample = self.GetAllPntXYZ()  # 画图
+        self.match_sample_vert = self.GetAllPntXYZ()  # 点匹配
+        self.important_sample_pnt = self.GetAllPntXYZ()  # 点与边集合匹配
         self.match_sample_edge = self.SampleUniformInCrv()
         self.important_sample_pnt = np.append(self.important_sample_pnt, self.match_sample_edge, 0)
 
@@ -422,7 +573,6 @@ class OccGeo:
         self.proj_vert_loc_indx = []  # 投影点对应的几何编号
         self.every_vert_mesh_indx = 0  # 每一个几何顶点在投影时对应的网格点编号 size(num_vertex, _)
         self.every_edge_mesh_indx = 0  # 每一个几何边在投影时对应的网格点编号   size(num_edge, _)
-
 
     def GetAllPntXYZ(self):
         """
@@ -480,7 +630,7 @@ class OccGeo:
                 self.int_map_vert.Bind(tmp_vertex, self.num_vertex)
                 my_pnt = MyVertex(self.num_vertex, tmp_vertex)
                 self.vertexs[self.num_vertex] = my_pnt
-                self.num_vertex += 1                                        # 点数量
+                self.num_vertex += 1  # 点数量
                 self.max_indx_vertex += 1
 
         # 遍历边
@@ -489,14 +639,14 @@ class OccGeo:
         map_edge2vert = []
         for i in range(1, geo_map_edge.Size() + 1):
             tmp_edge = topods.Edge(geo_map_edge.FindKey(i))
-            if BRep_Tool.Degenerated(tmp_edge):                             # 退化
+            if BRep_Tool.Degenerated(tmp_edge):  # 退化
                 continue
             if not self.int_map_edge.IsBound(tmp_edge):
                 self.int_map_edge.Bind(tmp_edge, self.num_edge)
                 my_edge = MyEdge(self.num_edge, tmp_edge, self.int_map_vert)
                 map_edge2vert.append([my_edge.end_pnt_index[0], my_edge.end_pnt_index[1]])
-                self.edges[self.num_edge] = my_edge                                  # 边
-                self.num_edge += 1                                          # 边数量
+                self.edges[self.num_edge] = my_edge  # 边
+                self.num_edge += 1  # 边数量
                 self.max_indx_edge += 1
 
         # 遍历面
@@ -536,7 +686,7 @@ class OccGeo:
         for key in self.faces:
             value = self.faces[key]
             tmp_face = value.face
-            surface_area = GetSufacesArea(tmp_face)
+            surface_area = get_sufaces_area(tmp_face)
             surfaces_areas.append(surface_area)
         return surfaces_areas
 
@@ -550,7 +700,7 @@ class OccGeo:
         curves_length = []
         for key, value in self.edges.items():
             topo_edge = value.edge
-            crv_length = GetEdgeLength(topo_edge)
+            crv_length = get_edge_length(topo_edge)
             curves_length.append(crv_length)
         return curves_length
 
@@ -572,9 +722,8 @@ class OccGeo:
         surfaces_areas = np.array(self.SufacesArea())
         vertex_per_len = np.sqrt(mesh_vertex_num / np.sum(surfaces_areas))  # 单位长度点数量
         for key, value in self.edges.items():
-            curves_length = GetEdgeLength(value.edge)
+            curves_length = get_edge_length(value.edge)
             self.edges[key].sample_num = np.int64(curves_length * vertex_per_len)
-
 
     def MeshNumInEachFace(self, mesh_vertex_num):
         """
@@ -584,9 +733,8 @@ class OccGeo:
         """
         surfaces_areas = np.array(self.SufacesArea())
         for key, value in self.faces.items():
-            area = GetSufacesArea(value.face)
+            area = get_sufaces_area(value.face)
             self.faces[key].sample_num = np.int64((area / np.sum(surfaces_areas)) * mesh_vertex_num)  # 每个面采样点数量
-
 
     def DeleteGeo(self, index, dim):
         """
@@ -604,7 +752,6 @@ class OccGeo:
             self.faces.pop(index)
             self.num_face -= 1
 
-
     def DeleteSmallEdge(self):
         """
         删除几何中打的短边
@@ -612,7 +759,7 @@ class OccGeo:
         delete_edge = []
         for key, value in self.edges.items():
             topo_edge = value.edge
-            edge_length = GetEdgeLength(topo_edge)
+            edge_length = get_edge_length(topo_edge)
             if edge_length < self.mesh_edge_len * 0.5:
                 # 处理线两端点的合并
                 v1_index = value.end_pnt_index[0]
@@ -678,10 +825,10 @@ class OccGeo:
             curve3D = value.curve
             first = value.first
             last = value.last
-            sample_num = value.sample_num                                   # 采样总数
+            sample_num = value.sample_num  # 采样总数
             vertex_num_in_each_curve.append(sample_num)
-            sample_interval = 1 / (sample_num + 1)                          # 单位长度的采样间隔
-            current_curve_interval = sample_interval * (last - first)       # 当前线段上的采样间隔
+            sample_interval = 1 / (sample_num + 1)  # 单位长度的采样间隔
+            current_curve_interval = sample_interval * (last - first)  # 当前线段上的采样间隔
             sample_loc = first + np.fromiter(iter(range(1, sample_num + 1)), dtype=int) * current_curve_interval
             current_sample_curve = []
             for j in range(sample_num):
@@ -729,12 +876,12 @@ class OccGeo:
                 random_u = np.random.random() * (bound[1] - bound[0]) + bound[0]
                 random_v = np.random.random() * (bound[3] - bound[2]) + bound[2]
                 outwire = current_surface_wire[0]
-                if not PntInPolygon(random_u, random_v, outwire):
+                if not pnt_in_polygon(random_u, random_v, outwire):
                     continue
                 if wire_num > 2:  # 继续检查内环
                     for m in range(1, wire_num):
                         current_wire = current_surface_wire[m]
-                        if PntInPolygon(random_u, random_v, current_wire):
+                        if pnt_in_polygon(random_u, random_v, current_wire):
                             continue
                 # 检查的uv合法
                 sample_pnt_3d = surface.Value(random_u, random_v)

@@ -5,8 +5,9 @@ import Loss
 import MyGeometry
 import Draw
 from pytorch3d.loss import mesh_laplacian_smoothing
+from pytorch3d.loss import mesh_normal_consistency
 from pytorch3d.structures.meshes import Meshes
-
+from pytorch3d.utils import ico_sphere
 
 global_scale = 0.001
 
@@ -23,11 +24,11 @@ def generate_icosphere(level=0, device=None):
     :param device:      pytorch的device
     :return:            网格
     """
-    t = (1.0 + 5 ** 0.5) / 2.0  # 黄金比例
     verts = [
-        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
-        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
-        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
+        [-0.5257, 0.8507, 0.0000], [0.5257, 0.8507, 0.0000], [-0.5257, -0.8507, 0.0000],
+        [0.5257, -0.8507, 0.0000],[0.0000, -0.5257, 0.8507], [0.0000, 0.5257, 0.8507],
+        [0.0000, -0.5257, -0.8507],[0.0000, 0.5257, -0.8507], [0.8507, 0.0000, -0.5257],
+        [0.8507, 0.0000, 0.5257], [-0.8507, 0.0000, -0.5257], [-0.8507, 0.0000, 0.5257],
     ]
     # 定义初始的二十个面（三角形）
     faces = [
@@ -106,14 +107,15 @@ else:
 
 #
 # # 4 级别 网格面细分迭代次数， 每增加一个级别，每个面将产生四个新面
-src_mesh = generate_icosphere(3, device)
-
+# src_mesh = generate_icosphere(3, device)
+src_mesh = ico_sphere(3, device)
 
 # 定义初始网格
 deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, requires_grad=True)
 
 # 几何文件名
-file_name = "cube.step"
+# file_name = "cube.step"
+file_name = "visor.step"
 
 # 设置网格尺寸
 mesh_vert_num = len(src_mesh.verts_packed())  # 初始网格顶点数
@@ -123,14 +125,14 @@ print("初始化的网格点数量为：", mesh_vert_num)
 geo = MyGeometry.OccGeo(file_name, mesh_vert_num)
 
 # The optimizer 优化器
-optimizer = torch.optim.SGD([deform_verts], lr=0.2, momentum=0.9)
+optimizer = torch.optim.SGD([deform_verts], lr=1, momentum=0.9)
 
 # Number of optimization steps
-Niter = 201
+Niter = 301
 
 # Weight for the chamfer loss
-w_surface = 10
-w_match_edge = 20
+w_surface = 1
+w_match_edge = 1
 w_angle = 0.3
 w_edge_length = 1  # 0.01
 w_normal = 0.1
@@ -162,19 +164,19 @@ for i in range(Niter):
 
     # 计算损失函数
     loss_edge_length = Loss.edge_length_loss(new_src_mesh)
-    loss_angle = Loss.MeshAngleLoss(new_src_mesh, torch.pi / 3)
-    loss_normal = mesh_laplacian_smoothing(new_src_mesh)
+    loss_angle = Loss.mesh_angle_loss(new_src_mesh, torch.pi / 3)
+    loss_normal = mesh_normal_consistency(new_src_mesh)
     loss_laplacian = Loss.laplacian_smoothing_loss(new_src_mesh)
 
-    if i < 100:
-        loss_surface = Loss.GeoProjSurfaceLoss(new_src_mesh, geo)
+    if i < 300:
+        loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
         total_loss = (
                     loss_surface * w_surface + loss_angle * w_angle + loss_edge_length * w_edge_length +
                     loss_normal * w_normal + loss_laplacian * w_laplacian)
         print(i, loss_surface, loss_angle, loss_edge_length, loss_normal, loss_laplacian)
         surface_losses.append(float(loss_surface.detach().cpu()))
     else:
-        loss_edge_match = Loss.GeoMatchloss(new_src_mesh, geo)
+        loss_edge_match = Loss.geo_match_loss(new_src_mesh, geo)
         total_loss = (loss_angle * w_angle + loss_edge_length * w_edge_length +
                       loss_normal * w_normal + loss_laplacian * w_laplacian + loss_edge_match * w_match_edge)
         print(i, loss_angle, loss_edge_length, loss_normal, loss_laplacian, loss_edge_match)
