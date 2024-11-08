@@ -1,7 +1,9 @@
+
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCC.Core.BRepGProp import brepgprop
+from OCC.Core.BRepLib import breplib
 from OCC.Core.BRepTools import BRepTools_WireExplorer
 from OCC.Core.BRepTools import breptools
 from OCC.Core.Bnd import Bnd_Box
@@ -20,8 +22,12 @@ from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnSurf
 import numpy as np
 import math
 
-geo_eps = 1e-4
 
+geo_eps = 1e-4
+# abc_data库里的几何存在单位，在occ读取的任意坐标数据为i中的1000倍，为了画图这里进行缩小
+global_scale = 0.001
+# 判断面之间是否连续的角度
+continuity_face_angel = 0.94
 
 def pnt_in_polygon(u, v, polygon):
     """
@@ -32,13 +38,20 @@ def pnt_in_polygon(u, v, polygon):
     :return:    ture 内  false 外
     """
     crossing = 0
-    for k in range(len(polygon) - 1):
+    n = len(polygon)
+    for k in range(n):
         a = np.array(polygon[k])
-        b = np.array(polygon[k + 1])
+        b = np.array(polygon[(k + 1) % n])
+        # 跳过水平边
+        if a[0] == b[0]:
+            continue
+        # 计算斜率
         slope = (b[1] - a[1]) / (b[0] - a[0])
+        # 条件判断
         cond1 = (a[0] <= u) and (u < b[0])
         cond2 = (b[0] <= u) and (u < a[0])
         above = v < slope * (u - a[0]) + a[1]
+        # 如果满足条件则交点计数
         if (cond1 or cond2) and above:
             crossing += 1
     return (crossing % 2 != 0)
@@ -452,6 +465,7 @@ class MyVertex:
         self.Y = self.pnt.Y()
         self.Z = self.pnt.Z()
         self.belong_curve_index = []
+        self.match_mesh_vert = -1
 
     def GetPntXYZ(self):
         return [self.X, self.Y, self.Z]
@@ -462,13 +476,18 @@ class MyEdge:
     边类
     """
 
-    def __init__(self, index, edge, map_vert):
+    def __init__(self, index, edge, map_vert, num):
         self.index = index
         self.edge = edge
         self.curve, self.first, self.last = BRep_Tool.Curve(edge)
-        self.belong_face_index = []
         self.orientation = edge.Orientation()
+        self.curve_length = get_edge_length(edge)
+        self.belong_face_index = []
+        # 利用图的最短路径匹配网格点
+        self.MeshVertToEdge = np.zeros(num)  # 构建计算图
         self.sample_num = 0
+        self.shortest_path = []
+        self.shortest_path_sample = []
         # 找到两个端点
         v1 = TopoDS_Vertex()
         v2 = TopoDS_Vertex()
@@ -486,6 +505,19 @@ class MyEdge:
             self.end_pnt_index.append(num1)
         self.discrete_curve, self.discrete_curve_dt = discrete_curve(self.curve, self.first, self.last, self.orientation)
 
+    def SampleEdge(self, sample_num):
+        """
+        根据匹配的最短路径上网格点的数量进行采样
+        :param sample_num:      最短路径网格点数量
+        """
+        self.shortest_path_sample = []
+        sample_interval = 1 / (sample_num + 1)                      # 单位长度的采样间隔
+        current_curve_interval = sample_interval * (self.last - self.first)  # 当前线段上的采样间隔
+        sample_loc = self.first + np.fromiter(iter(range(1, sample_num+1)), dtype=int) * current_curve_interval
+        for j in range(sample_num):
+            pnt = self.curve.Value(sample_loc[j])
+            sample_curve_xyz = [pnt.X(), pnt.Y(), pnt.Z()]
+            self.shortest_path_sample.append(sample_curve_xyz)
 
 class MyFace:
     """
@@ -496,6 +528,8 @@ class MyFace:
         self.index = index
         self.face = face
         self.surface = BRep_Tool.Surface(face)
+        self.surface_area = get_sufaces_area(face)
+        # 几何边界用于采样
         umin, umax, vmin, vmax = breptools.UVBounds(face)
         self.surfaces_bound = [umin, umax, vmin, vmax]
         self.sample_num = 0
@@ -546,35 +580,37 @@ class OccGeo:
         self.num_face = 0  # 面数量
 
         # 获取偏移量与缩放尺寸
-        self.GetOffset()
+        self.get_offset()
         # 几何偏移与缩放
-        self.TransformGEO()
+        self.tansform_geo()
         # 读取几何
-        self.ReadGeo()
+        self.read_geo()
+        # 估计工作时的网格尺寸大小
+        self.update_surfaces_area()
+        self.get_mesh_length()
         print("读取几何完成, 开始几何采样")
-        self.GetMeshLength()
-        self.DeleteSmallEdge()
+        self.delete_small_edge()
 
+        # 计算每条线相接曲面的连续性
+        self.no_continuity_edge = np.array([], dtype=np.int64)
+        self.no_continuity_vert = np.array([], dtype=np.int64)
+        self.get_continuity_face()
+        self.mesh_graph = 0
+        self.test_graph = 0
         # 按照网格数量计算采样点
-        self.MeshNumInEachEdge(vert_num)
-        self.plot_sample = self.GetAllPntXYZ()  # 画图
-        self.match_sample_vert = self.GetAllPntXYZ()  # 点匹配
-        self.important_sample_pnt = self.GetAllPntXYZ()  # 点与边集合匹配
-        self.match_sample_edge = self.SampleUniformInCrv()
-        self.important_sample_pnt = np.append(self.important_sample_pnt, self.match_sample_edge, 0)
-
-        self.sample_surface_num = self.MeshNumInEachFace(vert_num - self.important_sample_pnt.shape[0])
-        self.match_sample_surface = self.SampleInSurface()
+        # 按照网格数量计算采样点画图
+        self.mesh_num_in_edge()
+        self.mesh_num_in_face()
+        self.plot_sample = np.array(self.get_all_pnt_xyz())  # 画图
+        _, sample_edge = self.sample_uniform_in_crv(1)
+        if len(sample_edge) != 0:
+            self.plot_sample = np.append(self.plot_sample, np.array(sample_edge), 0)
+        _, sample_surface = self.sample_in_surface(1)
+        if len(sample_surface) != 0:
+            self.plot_sample = np.append(self.plot_sample, np.array(sample_surface), 0)
         print("几何采样完成")
 
-        self.mesh_vert_belong_face = 0
-        self.face_contain_mesh_vert = 0
-        self.proj_vert_loc = []  # 投影点对应的几何 （面0，线1，点2）
-        self.proj_vert_loc_indx = []  # 投影点对应的几何编号
-        self.every_vert_mesh_indx = 0  # 每一个几何顶点在投影时对应的网格点编号 size(num_vertex, _)
-        self.every_edge_mesh_indx = 0  # 每一个几何边在投影时对应的网格点编号   size(num_edge, _)
-
-    def GetAllPntXYZ(self):
+    def get_all_pnt_xyz(self):
         """
         返回所有几何点的坐标np_list
         :return:
@@ -585,7 +621,7 @@ class OccGeo:
             all_xyz.append(current_xyz)
         return np.array(all_xyz)
 
-    def GetOffset(self):
+    def get_offset(self):
         """
         获取原始几何到单位几何的偏移量与比例
         """
@@ -598,9 +634,9 @@ class OccGeo:
         mean_z = (shape_zmax + shape_zmin) / 2
         self.center = gp_Vec(-mean_x, -mean_y, -mean_z)
         max_box_len = max([shape_xmax - mean_x, shape_ymax - mean_y, shape_zmax - mean_z])
-        self.scale = 1 / (max_box_len * np.sqrt(2))
+        self.scale = 1 / (max_box_len * 2)
 
-    def TransformGEO(self):
+    def tansform_geo(self):
         """
         将原始几何进行移动缩放至单位球内部
         """
@@ -617,7 +653,7 @@ class OccGeo:
         self.geo = transform_build1.Shape()
 
     # 读取几何
-    def ReadGeo(self):
+    def read_geo(self):
         """
         读取几何
         """
@@ -643,7 +679,7 @@ class OccGeo:
                 continue
             if not self.int_map_edge.IsBound(tmp_edge):
                 self.int_map_edge.Bind(tmp_edge, self.num_edge)
-                my_edge = MyEdge(self.num_edge, tmp_edge, self.int_map_vert)
+                my_edge = MyEdge(self.num_edge, tmp_edge, self.int_map_vert, self.mesh_vert_num)
                 map_edge2vert.append([my_edge.end_pnt_index[0], my_edge.end_pnt_index[1]])
                 self.edges[self.num_edge] = my_edge  # 边
                 self.num_edge += 1  # 边数量
@@ -677,66 +713,75 @@ class OccGeo:
         for i in range(self.num_edge):
             self.edges[i].belong_face_index = np.array(map_edge2face[i])
 
-    def SufacesArea(self):
+    def update_surfaces_area(self):
         """
         计算所有几何面面积
-        :return: 面积[s1, s2, s3,....]
         """
-        surfaces_areas = []
+        self.surfaces_area = []
         for key in self.faces:
             value = self.faces[key]
-            tmp_face = value.face
-            surface_area = get_sufaces_area(tmp_face)
-            surfaces_areas.append(surface_area)
-        return surfaces_areas
+            surface_area = value.surface_area
+            self.surfaces_area.append(surface_area)
 
-    # 计算cure 长度
-    def CurveLength(self):
+
+    def update_curve_length(self):
         """
-        计算几何内所有边长度
-        :return:  长度集合
+        计算所有边的长度
+        """
+        self.curves_length = []
+        for key, value in self.edges.items():
+            crv_length = value.curve_length
+            self.curves_length.append(crv_length)
+
+    def get_continuity_face(self):
+        """
+        计算每条边处所属两个面的连接情况
         """
 
-        curves_length = []
         for key, value in self.edges.items():
             topo_edge = value.edge
-            crv_length = get_edge_length(topo_edge)
-            curves_length.append(crv_length)
-        return curves_length
+            edge_belong_face_indx  = value.belong_face_index
+            belong_face_num = len(edge_belong_face_indx)
+            if belong_face_num > 1:
+                for i in range(belong_face_num):
+                    topo_face1 = self.faces[edge_belong_face_indx[i]].face
+                    topo_face2 = self.faces[edge_belong_face_indx[(i+1) % belong_face_num]].face
+                    continuity = breplib.ContinuityOfFaces(topo_edge, topo_face1, topo_face2, continuity_face_angel)
+                    if not continuity:
+                        self.no_continuity_edge = np.append(self.no_continuity_edge, key)
+                        self.no_continuity_vert = np.append(self.no_continuity_vert, np.array(value.end_pnt_index))
+                        self.no_continuity_vert = np.unique(self.no_continuity_vert)
+                        continue
 
-    def GetMeshLength(self):
+    def get_mesh_length(self):
         """
         估算网格尺寸
         """
-        surfaces_areas = np.array(self.SufacesArea())
-        vertex_per_len = np.sqrt(self.mesh_vert_num / np.sum(surfaces_areas))  # 单位长度点数量
+        vertex_per_len = np.sqrt(self.mesh_vert_num / np.sum(self.surfaces_area))  # 单位长度点数量
         self.mesh_edge_len = 1 / vertex_per_len
-        print("工作网格尺寸为：", self.mesh_edge_len)
+        print("根据面积估计工作网格尺寸大小为：", self.mesh_edge_len)
 
     #
-    def MeshNumInEachEdge(self, mesh_vertex_num):
+    def mesh_num_in_edge(self):
         """
         根据面积与长度分配网格点数量,返回网格边长度,每一条线分配的点数量,每个面分配的点数量
-        :param mesh_vertex_num:     网格总数
         """
-        surfaces_areas = np.array(self.SufacesArea())
-        vertex_per_len = np.sqrt(mesh_vertex_num / np.sum(surfaces_areas))  # 单位长度点数量
+        surfaces_areas = np.array(self.surfaces_area)
+        vertex_per_len = np.sqrt(self.mesh_vert_num / np.sum(surfaces_areas))  # 单位长度点数量
         for key, value in self.edges.items():
             curves_length = get_edge_length(value.edge)
             self.edges[key].sample_num = np.int64(curves_length * vertex_per_len)
 
-    def MeshNumInEachFace(self, mesh_vertex_num):
+    def mesh_num_in_face(self):
         """
         计算面采样点数量
-        :param mesh_vertex_num: 总体采样点数量
-        :return:
         """
-        surfaces_areas = np.array(self.SufacesArea())
+        surfaces_areas = np.array(self.surfaces_area)
         for key, value in self.faces.items():
             area = get_sufaces_area(value.face)
-            self.faces[key].sample_num = np.int64((area / np.sum(surfaces_areas)) * mesh_vertex_num)  # 每个面采样点数量
+            self.faces[key].sample_num = np.int64((area / np.sum(surfaces_areas)) * self.mesh_vert_num)  # 每个面采样点数量
 
-    def DeleteGeo(self, index, dim):
+    def delete_geo(self, index, dim):
         """
         删除编号为index的几何
         :param index:   删除几何的编号
@@ -752,7 +797,7 @@ class OccGeo:
             self.faces.pop(index)
             self.num_face -= 1
 
-    def DeleteSmallEdge(self):
+    def delete_small_edge(self):
         """
         删除几何中打的短边
         """
@@ -766,16 +811,16 @@ class OccGeo:
                 v2_index = value.end_pnt_index[1]
                 pnt1 = self.vertexs[v1_index]
                 pnt2 = self.vertexs[v2_index]
-                self.MergeClosePnt(pnt1, pnt2)
+                self.merge_closed_pnt(pnt1, pnt2)
                 # 删除面中包含的该短边的编号
                 for i in value.belong_face_index:
                     self.faces[i].contain_edge_index = [x for x in self.faces[i].contain_edge_index if x != value.index]
                 # 删除短边
                 delete_edge.append(value.index)
         for small in delete_edge:
-            self.DeleteGeo(small, 1)
+            self.delete_geo(small, 1)
 
-    def MergeClosePnt(self, point1, point2):
+    def merge_closed_pnt(self, point1, point2):
         """
         合并两个很近的点
         :param point1:      点1
@@ -800,79 +845,60 @@ class OccGeo:
             # 增加pnt2的关系至pnt1
             belong_curve = np.unique(np.append(point2.belong_curve_index, point1.belong_curve_index))
             self.vertexs[reserve_pnt_index].belong_curve_index = belong_curve
-            self.DeleteGeo(delete_pnt_index, 0)
+            self.delete_geo(delete_pnt_index, 0)
 
     # 根据网格长度对模型中边界进行采样
-    def SampleUniformInCrv(self):
+    def sample_uniform_in_crv(self, multiple):
         """
         geo中所有几何线均匀采样(不包含起点终点)
         :return: 采样点坐标集合 [[[x1,y1,z1], [x2,y2,z2],...], [线2]，...]
         """
         sample_curve = []
+        sample_num = 0
         # 找到不连续需要采样的边
         sample_edges_index = []
         sample_curve_num = 0
         for key, value in self.edges.items():
             # 连续条件与采样点数量不为零
-            if self.edges[key].sample_num != 0:
+            if key in self.no_continuity_edge and self.edges[key].sample_num != 0:
                 sample_edges_index.append(key)
                 sample_curve_num += 1
 
         # 开始采样
-        vertex_num_in_each_curve = []
         for key in sample_edges_index:
             value = self.edges[key]
             curve3D = value.curve
             first = value.first
             last = value.last
-            sample_num = value.sample_num  # 采样总数
-            vertex_num_in_each_curve.append(sample_num)
-            sample_interval = 1 / (sample_num + 1)  # 单位长度的采样间隔
+            current_sample_num = value.sample_num * multiple  # 采样总数
+            sample_num += current_sample_num
+            sample_interval = 1 / (current_sample_num + 1)  # 单位长度的采样间隔
             current_curve_interval = sample_interval * (last - first)  # 当前线段上的采样间隔
-            sample_loc = first + np.fromiter(iter(range(1, sample_num + 1)), dtype=int) * current_curve_interval
-            current_sample_curve = []
-            for j in range(sample_num):
+            sample_loc = first + np.fromiter(iter(range(1, current_sample_num + 1)),
+                                             dtype=int) * current_curve_interval
+            for j in range(current_sample_num):
                 pnt = curve3D.Value(sample_loc[j])
                 sample_curve_xyz = [pnt.X(), pnt.Y(), pnt.Z()]
-                current_sample_curve.append(sample_curve_xyz)
-                self.plot_sample = np.append(self.plot_sample, np.array([sample_curve_xyz]), 0)
-            sample_curve.append(current_sample_curve)
-        # 按照边两端开始采样点排序
-        vertex_num_in_each_curve = np.array(vertex_num_in_each_curve)
-        max_sample_num = vertex_num_in_each_curve.max()
-        odd_even_flag = vertex_num_in_each_curve % 2
-        half_max = math.ceil(max_sample_num / 2)
-        for i in range(half_max):
-            for j in range(sample_curve_num):
-                if (i + 1) * 2 > vertex_num_in_each_curve[j]:
-                    continue
-                if odd_even_flag[j] == 1 and i == half_max:
-                    mid = sample_curve[j][i]
-                    new_sample_curve = np.append(new_sample_curve, mid, 0)
-                    continue
-                first = np.array([sample_curve[j][i]])
-                last = np.array([sample_curve[j][-1 - i]])
-                if i == 0 and j == 0:
-                    new_sample_curve = first.copy()
-                else:
-                    new_sample_curve = np.append(new_sample_curve, first, 0)
-                new_sample_curve = np.append(new_sample_curve, last, 0)
-        return new_sample_curve
+                sample_curve.append(sample_curve_xyz)
+        return sample_num, sample_curve
 
-    def SampleInSurface(self):
+    def sample_in_surface(self, multiple):
         """
         geo中所有几何面随机采样
         :param vertex_num_in_each_surface: 采每一个面样点数量[m, m, m,...]
         :return: 采样点坐标集合 [[x1,y1,z1], [x2,y2,z2],...]
         """
+        sample_surface = []
+        sample_num = 0
         for key, value in self.faces.items():
             surface = value.surface
             current_surface_wire = value.wire_discrete_point
             wire_num = value.wire_num
-            current_surface_sample_num = value.sample_num
+            current_surface_sample_num = value.sample_num * multiple
+            sample_num += current_surface_sample_num
             bound = value.surfaces_bound
-            count = 0
-            while count < current_surface_sample_num:
+            had_sample_num = 0
+            while had_sample_num < current_surface_sample_num:
                 random_u = np.random.random() * (bound[1] - bound[0]) + bound[0]
                 random_v = np.random.random() * (bound[3] - bound[2]) + bound[2]
                 outwire = current_surface_wire[0]
@@ -885,12 +911,7 @@ class OccGeo:
                             continue
                 # 检查的uv合法
                 sample_pnt_3d = surface.Value(random_u, random_v)
-                sample_pnt_3d_xyz = np.array([[sample_pnt_3d.X(), sample_pnt_3d.Y(), sample_pnt_3d.Z()]])
-                if count == 0:
-                    surface_sample = sample_pnt_3d_xyz.copy()
-
-                else:
-                    surface_sample = np.append(surface_sample, sample_pnt_3d_xyz, 0)
-                self.plot_sample = np.append(self.plot_sample, sample_pnt_3d_xyz, 0)
-                count += 1
-        return surface_sample
+                sample_pnt_3d_xyz = [sample_pnt_3d.X(), sample_pnt_3d.Y(), sample_pnt_3d.Z()]
+                sample_surface.append(sample_pnt_3d_xyz)
+                had_sample_num += 1
+        return sample_num, sample_surface

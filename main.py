@@ -1,101 +1,13 @@
-import math
 import aspose.threed as a3d
 import torch
+import Match
 import Loss
 import MyGeometry
 import Draw
-from pytorch3d.loss import mesh_laplacian_smoothing
+import Myio
+from Match import create_mesh_graph
 from pytorch3d.loss import mesh_normal_consistency
-from pytorch3d.structures.meshes import Meshes
-from pytorch3d.utils import ico_sphere
 
-global_scale = 0.001
-
-
-# 比较浮点数是否一样
-def IsFloatEq(a, b, eps):
-    return abs(a - b) < eps
-
-
-def generate_icosphere(level=0, device=None):
-    """
-    生成一个单位半径的二十面体球体（icosphere）
-    :param level:       细分层数
-    :param device:      pytorch的device
-    :return:            网格
-    """
-    verts = [
-        [-0.5257, 0.8507, 0.0000], [0.5257, 0.8507, 0.0000], [-0.5257, -0.8507, 0.0000],
-        [0.5257, -0.8507, 0.0000],[0.0000, -0.5257, 0.8507], [0.0000, 0.5257, 0.8507],
-        [0.0000, -0.5257, -0.8507],[0.0000, 0.5257, -0.8507], [0.8507, 0.0000, -0.5257],
-        [0.8507, 0.0000, 0.5257], [-0.8507, 0.0000, -0.5257], [-0.8507, 0.0000, 0.5257],
-    ]
-    # 定义初始的二十个面（三角形）
-    faces = [
-        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
-        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
-        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
-        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
-    ]
-
-    # 缓存中点索引的字典，避免重复创建中点
-    mid_point_cache = {}
-
-    # 逐级细分
-    for _ in range(level):
-        new_faces = []
-        for v1, v2, v3 in faces:
-            # 计算每条边的中点，直接嵌入细分过程
-            edge_keys = [(v1, v2), (v2, v3), (v3, v1)]
-            mid_points = []
-            for v_start, v_end in edge_keys:
-                # 确保边的顺序一致 (无向边)
-                edge_key = tuple(sorted((v_start, v_end)))
-                if edge_key not in mid_point_cache:
-                    # 计算并归一化新顶点
-                    midpoint = (torch.tensor(verts[v_start]) + torch.tensor(verts[v_end])).to(device) / 2.0
-                    midpoint = midpoint / midpoint.norm()  # 归一化
-                    verts.append(midpoint.tolist())
-                    mid_point_cache[edge_key] = len(verts) - 1  # 新顶点索引
-                mid_points.append(mid_point_cache[edge_key])
-
-            # 获取三角形的4个面
-            a, b, c = mid_points
-            new_faces.extend([
-                [v1, a, c],
-                [v2, b, a],
-                [v3, c, b],
-                [a, b, c],
-            ])
-        faces = new_faces  # 更新面列表
-
-    # 转换为 PyTorch 张量
-    verts = torch.tensor(verts, dtype=torch.float32, device=device)
-    faces = torch.tensor(faces, dtype=torch.int64, device=device)
-
-    return Meshes(verts=[verts], faces=[faces])
-
-
-def save_obj(filepath, verts, faces):
-    """
-    将网格的顶点和面数据保存为 .obj 文件
-    :param filepath:        保存 .obj 文件的路径   (str)
-    :param verts:           顶点坐标，形状为 (V, 3) (torch.Tensor)
-    :param faces:           面的顶点索引，形状为 (F, 3) (torch.Tensor)
-    :return:
-    """
-    with open(filepath, 'w') as file:
-        # 写入顶点
-        for v in verts:
-            file.write(f"v {v[0].item()} {v[1].item()} {v[2].item()}\n")
-
-        # 写入面信息
-        for face in faces:
-            face_str = "f"
-            for i in face:
-                # 注意：.obj 文件的索引从 1 开始
-                face_str += f" {i.item() + 1}"
-            file.write(face_str + "\n")
 
 
 # # Set the device
@@ -107,8 +19,7 @@ else:
 
 #
 # # 4 级别 网格面细分迭代次数， 每增加一个级别，每个面将产生四个新面
-# src_mesh = generate_icosphere(3, device)
-src_mesh = ico_sphere(3, device)
+src_mesh = Myio.generate_icosphere(3, device)
 
 # 定义初始网格
 deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, requires_grad=True)
@@ -123,6 +34,10 @@ mesh_vert_num = len(src_mesh.verts_packed())  # 初始网格顶点数
 # 读取几何
 print("初始化的网格点数量为：", mesh_vert_num)
 geo = MyGeometry.OccGeo(file_name, mesh_vert_num)
+create_mesh_graph(src_mesh, geo)
+
+final_scale = geo.scale / MyGeometry.global_scale
+final_translation = torch.tensor([geo.center.X(), geo.center.Y(), geo.center.Z()]) * MyGeometry.global_scale
 
 # The optimizer 优化器
 optimizer = torch.optim.SGD([deform_verts], lr=1, momentum=0.9)
@@ -153,9 +68,8 @@ laplacian_losses = []
 
 
 torch.set_printoptions(precision=8)
-final_scale = geo.scale / global_scale
-final_translation = torch.tensor([geo.center.X(), geo.center.Y(), geo.center.Z()]) * global_scale
-#
+
+
 print("开始计算")
 for i in range(Niter):
     # Initialize optimizer 初始化
@@ -168,7 +82,7 @@ for i in range(Niter):
     loss_normal = mesh_normal_consistency(new_src_mesh)
     loss_laplacian = Loss.laplacian_smoothing_loss(new_src_mesh)
 
-    if i < 300:
+    if i < 200:
         loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
         total_loss = (
                     loss_surface * w_surface + loss_angle * w_angle + loss_edge_length * w_edge_length +
@@ -201,12 +115,36 @@ for i in range(Niter):
 
 # 保存obj以及stl
 final_verts, final_faces = new_src_mesh.get_mesh_verts_faces(0)
+final_obj1 = 'final_model_test.obj'
+Myio.save_obj(final_obj1, final_verts, final_faces)
 final_verts = final_verts / final_scale - final_translation
 final_obj = 'final_model.obj'
-save_obj(final_obj, final_verts, final_faces)
+Myio.save_obj(final_obj, final_verts, final_faces)
 
 scene = a3d.Scene.from_file("final_model.obj")
 scene.save("final_model.stl")
 
-Draw.plot_finall_loss(surface_losses, match_edge_losses, angle_losses, edge_length_losses, normal_losses, laplacian_losses)
+# from Myio import Meshes
+# verts, faces = Myio.read_obj("final_model_test.obj")
+# new_src_mesh = Meshes(verts=[verts], faces=[faces])
+
+# #几何贴体
+final_mesh_local = Match.match_and_proj_final_mesh(new_src_mesh, geo)
+deform = final_mesh_local - new_src_mesh.verts_packed()
+new_src_mesh = new_src_mesh.offset_verts(deform)
+
+# Fetch the verts and faces of the final predicted mesh
+final_verts, final_faces = new_src_mesh.get_mesh_verts_faces(0)
+
+# Scale normalize back to the original target size
+final_verts = final_verts / final_scale - final_translation
+
+# Store the predicted mesh using save_obj
+final_obj = 'final_model_proj.obj'
+Myio.save_obj(final_obj, final_verts, final_faces)
+scene = a3d.Scene.from_file("final_model_proj.obj")
+scene.save("final_model_proj.stl")
+
+
+Draw.plot_final_loss(surface_losses, match_edge_losses, angle_losses, edge_length_losses, normal_losses, laplacian_losses)
 

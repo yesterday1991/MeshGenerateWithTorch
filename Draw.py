@@ -69,7 +69,7 @@ def plot_two_point(points1, points2):
     ax.view_init(190, 30)
     plt.show()
 
-def plot_finall_loss(surface_losses, match_edge_losses, angle_losses, edge_length_losses, normal_losses, laplacian_losses):
+def plot_final_loss(surface_losses, match_edge_losses, angle_losses, edge_length_losses, normal_losses, laplacian_losses):
     fig1 = plt.figure(figsize=(13, 5))
     ax1 = fig1.gca()
     ax1.plot(surface_losses, label="surface_losses")

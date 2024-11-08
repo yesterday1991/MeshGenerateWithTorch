@@ -1,67 +1,8 @@
 
 import torch
-from OCC.Core.gp import gp_Pnt
 import torch.nn as nn
 from MyGeometry import project_mesh_vert_to_geo
-
-
-def match_pnt_to_mesh(src_mesh, pnt, had_match):
-    """
-    以最短距离为标准匹配pnt在网格中对应的网格节点
-    :param src_mesh:        网格
-    :param pnt:             匹配点 list=[X, Y, Z]
-    :param had_match:       已经匹配过的点 tensor
-    :return:                pnt在src_mesh中匹配的网格节点编号 int
-    """
-    mesh_vert = src_mesh.verts_packed().detach()
-    optional_mesh_vert = mesh_vert
-    verts_num = optional_mesh_vert.shape[0]
-    min_dist = float("inf")
-    min_indx = -1
-    geo_pnt = gp_Pnt(pnt[0], pnt[1], pnt[2])
-    for i in range(verts_num):
-        if i in had_match:
-            continue
-        current_pnt = gp_Pnt(optional_mesh_vert[i][0].item(), optional_mesh_vert[i][1].item(), optional_mesh_vert[i][2].item())
-        dist = current_pnt.Distance(geo_pnt)
-        if dist < min_dist:
-            min_dist = dist
-            min_indx = i
-    return min_indx
-
-
-def match_sample_geo_with_mesh(src_mesh, geo, had_matched_indx, geo_flag):
-    """
-    将geo中采样点与src_mesh网格中网格点按顶点，边，面顺序按最短距离进行匹配
-    :param src_mesh:            网格
-    :param geo:                 几何
-    :param had_matched_indx:    已经匹配过的网格点编号 tensor
-    :param geo_flag:            处理边界采样点还是面内采样点
-    :return:                    几何采样点集合， 采样点对应的网格点编号
-    """
-    sample_total = []  # 将采样点统一放入一个数组中
-    match_indx = torch.tensor([], dtype=torch.int)
-    if geo_flag == 0:   # 面
-        matched = geo.match_sample_surface
-    elif geo_flag == 1: # 边
-        matched = geo.match_sample_edge
-    elif geo_flag == 2: # 顶点
-        matched = geo.match_sample_vert
-    elif geo_flag == 3:
-        matched = geo.important_sample_pnt
-    matched = matched.tolist()
-    for j in matched:
-        current_match = match_pnt_to_mesh(src_mesh, j, had_matched_indx)  # 匹配
-        sample_total.append(j)
-        had_matched_indx = torch.cat((had_matched_indx, torch.tensor([current_match], dtype=torch.int)))
-        match_indx = torch.cat((match_indx, torch.tensor([current_match], dtype=torch.int)))
-
-    mesh_verts = src_mesh.verts_packed()
-    # plot_two_point(sample_total, match_verts_tensor)
-    return torch.tensor(sample_total), match_indx
-
-
-
+import Match
 
 
 def geo_match_loss(trg_mesh, src_geo):
@@ -73,12 +14,29 @@ def geo_match_loss(trg_mesh, src_geo):
     """
     mesh_verts = trg_mesh.verts_packed()
     had_matched = torch.tensor([], dtype=torch.int)
-    matched_pnt_tensor, current_matched = match_sample_geo_with_mesh(trg_mesh, src_geo, had_matched, 3)
-    match_verts_tensor = mesh_verts[current_matched]
+    # 匹配几何点
+    Match.match_geo_vert(trg_mesh, src_geo, [])
+    matched_pnt = []
+    # 提取出几何点匹配数据
+    for key, value in src_geo.vertexs.items():
+        had_matched = torch.cat([had_matched, torch.tensor([value.match_mesh_vert], dtype=torch.int)])
+        matched_pnt.append(value.GetPntXYZ())
+    # 更新网格点到各个边的距离，作为图的权重
+    Match.update_mesh_vert_to_edge_dist(trg_mesh, src_geo)
+    # 利用最短路径去匹配边
+    Match.match_no_continuity_Edge(trg_mesh, src_geo)
+    # 获取边匹配数据
+    for key, value in src_geo.edges.items():
+        if key in src_geo.no_continuity_edge:
+            had_matched = torch.cat([had_matched, torch.tensor(value.shortest_path, dtype=torch.int)])
+            for xyz in value.shortest_path_sample:
+                matched_pnt.append(xyz)
+    # 计算损失
+    matched_pnt_tensor = torch.tensor(matched_pnt)
+    match_verts_tensor = mesh_verts[had_matched]
     mseloss = nn.MSELoss()
     mean_loss = mseloss(match_verts_tensor, matched_pnt_tensor)
     return mean_loss
-
 
 def geo_proj_surface_loss(trg_mesh, src_geo):
     """
