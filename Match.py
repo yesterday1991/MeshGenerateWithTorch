@@ -1,6 +1,5 @@
 from OCC.Core.gp import gp_Pnt
 import MyGeometry
-import networkx as nx
 import torch
 
 

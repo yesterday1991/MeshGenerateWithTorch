@@ -24,8 +24,6 @@ import math
 
 
 geo_eps = 1e-4
-# abc_data库里的几何存在单位，在occ读取的任意坐标数据为i中的1000倍，为了画图这里进行缩小
-global_scale = 0.001
 # 判断面之间是否连续的角度
 continuity_face_angel = 0.94
 
@@ -558,6 +556,7 @@ class MyFace:
             exp_wire.Next()
 
 
+
 class OccGeo:
     def __init__(self, name, vert_num):
         self.original_geo = read_step_file(name)
@@ -582,7 +581,7 @@ class OccGeo:
         # 获取偏移量与缩放尺寸
         self.get_offset()
         # 几何偏移与缩放
-        self.tansform_geo()
+        self.transform_geo()
         # 读取几何
         self.read_geo()
         # 估计工作时的网格尺寸大小
@@ -596,7 +595,6 @@ class OccGeo:
         self.no_continuity_vert = np.array([], dtype=np.int64)
         self.get_continuity_face()
         self.mesh_graph = 0
-        self.test_graph = 0
         # 按照网格数量计算采样点
         # 按照网格数量计算采样点画图
         self.mesh_num_in_edge()
@@ -636,7 +634,7 @@ class OccGeo:
         max_box_len = max([shape_xmax - mean_x, shape_ymax - mean_y, shape_zmax - mean_z])
         self.scale = 1 / (max_box_len * 2)
 
-    def tansform_geo(self):
+    def transform_geo(self):
         """
         将原始几何进行移动缩放至单位球内部
         """

@@ -7,7 +7,15 @@ import Draw
 import Myio
 from Match import create_mesh_graph
 from pytorch3d.loss import mesh_normal_consistency
+import time
 
+
+abc = False
+# abc_data库里的几何存在单位，在occ读取的任意坐标数据为i中的1000倍，为了画图这里进行缩小
+if abc:
+    global_scale = 0.001
+else:
+    global_scale = 1
 
 
 # # Set the device
@@ -26,7 +34,9 @@ deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, req
 
 # 几何文件名
 # file_name = "cube.step"
-file_name = "visor.step"
+# file_name = "visor.step"
+# file_name = "Part 3.step"
+file_name = "new_part4.step"
 
 # 设置网格尺寸
 mesh_vert_num = len(src_mesh.verts_packed())  # 初始网格顶点数
@@ -36,16 +46,17 @@ print("初始化的网格点数量为：", mesh_vert_num)
 geo = MyGeometry.OccGeo(file_name, mesh_vert_num)
 create_mesh_graph(src_mesh, geo)
 
-final_scale = geo.scale / MyGeometry.global_scale
-final_translation = torch.tensor([geo.center.X(), geo.center.Y(), geo.center.Z()]) * MyGeometry.global_scale
+final_scale = geo.scale / global_scale
+final_translation = torch.tensor([geo.center.X(), geo.center.Y(), geo.center.Z()]) * global_scale
 
 # The optimizer 优化器
-optimizer = torch.optim.SGD([deform_verts], lr=1, momentum=0.9)
+optimizer = torch.optim.SGD([deform_verts], lr=1, momentum=0.9)  # Adam([deform_verts], lr=0.01) #
 
 # Number of optimization steps
-Niter = 301
+Niter = 500
 
 # Weight for the chamfer loss
+w_chamfer = 1
 w_surface = 1
 w_match_edge = 1
 w_angle = 0.3
@@ -53,12 +64,10 @@ w_edge_length = 1  # 0.01
 w_normal = 0.1
 w_laplacian = 0.05
 
-# Plot period for the losses
-plot_period = 100
 # 网格修正周期
 correct_mesh_period = 50
 
-
+chamfer_losses = []
 surface_losses = []
 match_edge_losses = []
 angle_losses = []
@@ -81,20 +90,25 @@ for i in range(Niter):
     loss_angle = Loss.mesh_angle_loss(new_src_mesh, torch.pi / 3)
     loss_normal = mesh_normal_consistency(new_src_mesh)
     loss_laplacian = Loss.laplacian_smoothing_loss(new_src_mesh)
-
-    if i < 200:
-        loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
+    if i < 400:
+        loss_chamfer = Loss.geo_chamfer_loss(new_src_mesh, geo)
+        # loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
         total_loss = (
-                    loss_surface * w_surface + loss_angle * w_angle + loss_edge_length * w_edge_length +
-                    loss_normal * w_normal + loss_laplacian * w_laplacian)
-        print(i, loss_surface, loss_angle, loss_edge_length, loss_normal, loss_laplacian)
-        surface_losses.append(float(loss_surface.detach().cpu()))
+                     loss_angle * w_angle + loss_edge_length * w_edge_length + loss_chamfer * w_chamfer +
+                    loss_normal * w_normal + loss_laplacian * w_laplacian)  #  loss_surface * w_surface +
+        print(i, loss_chamfer, loss_angle, loss_edge_length, loss_normal, loss_laplacian)
+        chamfer_losses.append(float(loss_chamfer.detach().cpu()))
+        match_edge_losses.append(0)
+        # surface_losses.append(float(loss_surface.detach().cpu()))
     else:
         loss_edge_match = Loss.geo_match_loss(new_src_mesh, geo)
+        loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
         total_loss = (loss_angle * w_angle + loss_edge_length * w_edge_length +
                       loss_normal * w_normal + loss_laplacian * w_laplacian + loss_edge_match * w_match_edge)
         print(i, loss_angle, loss_edge_length, loss_normal, loss_laplacian, loss_edge_match)
         match_edge_losses.append(float(loss_edge_match.detach().cpu()))
+        chamfer_losses.append(0)
+
 
     angle_losses.append(float(loss_angle.detach().cpu()))
     edge_length_losses.append(float(loss_edge_length.detach().cpu()))
@@ -106,12 +120,12 @@ for i in range(Niter):
     optimizer.step()
 
     # Plot mesh
-    # if i % plot_period == 0:
+    # if i % 100 == 0:
     #     Draw.plot_pointcloud(new_src_mesh, geo, False)
-    #     tmp_file_name = "tmp%d.obj" % i
-    #     tmp_out_verts, tmp_out_faces = new_src_mesh.get_mesh_verts_faces(0)
-    #     tmp_out_verts = tmp_out_verts / final_scale - final_translation
-    #     save_obj(tmp_file_name, tmp_out_verts, tmp_out_faces)
+        # tmp_file_name = "tmp%d.obj" % i
+        # tmp_out_verts, tmp_out_faces = new_src_mesh.get_mesh_verts_faces(0)
+        # tmp_out_verts = tmp_out_verts / final_scale - final_translation
+        # Myio.save_obj(tmp_file_name, tmp_out_verts, tmp_out_faces)
 
 # 保存obj以及stl
 final_verts, final_faces = new_src_mesh.get_mesh_verts_faces(0)

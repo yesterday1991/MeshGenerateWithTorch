@@ -3,6 +3,53 @@ import torch
 import torch.nn as nn
 from MyGeometry import project_mesh_vert_to_geo
 import Match
+from pytorch3d.ops import sample_points_from_meshes
+
+
+def chamfer_distance(points1, points2):
+    """
+        计算两个点云之间的 Chamfer 距离。
+    :param points1:     第一个点云Tensor，形状为 (N, 3)
+    :param points2:     第二个点云Tensor，形状为 (N, 3)
+    :return:        Chamfer 距离的标量值Tensor
+    """
+    # 计算所有点对之间的欧氏距离平方
+    diff = points1.unsqueeze(1) - points2.unsqueeze(0)  # (N, M, 3)
+    dist_matrix = torch.sum(diff ** 2, dim=2)  # (N, M)
+
+    # 对于 points1 中的每个点，找到 points2 中最近的点并取均值
+    min_dist1, _ = torch.min(dist_matrix, dim=1)  # (N,)
+    loss1 = torch.mean(min_dist1)  # 均值
+
+    # 对于 points2 中的每个点，找到 points1 中最近的点并取均值
+    min_dist2, _ = torch.min(dist_matrix, dim=0)  # (M,)
+    loss2 = torch.mean(min_dist2)  # 均值
+
+    # 返回 Chamfer 距离（取均值确保对称性）
+    chamfer_dist = (loss1 + loss2)
+    return chamfer_dist
+
+def geo_chamfer_loss(trg_mesh, src_geo):
+    """
+    计算点云损失
+    :param trg_mesh:        网格
+    :param src_geo:         几何
+    :return:                损失
+    """
+    # 几何离散采样
+    total_sample_num = src_geo.num_vertex
+    sample_geo_tensor = torch.tensor(src_geo.get_all_pnt_xyz(), dtype=torch.float32)
+    num1, sample_edge = src_geo.sample_uniform_in_crv(1)
+    num2, sample_surface = src_geo.sample_in_surface(4)
+    total_sample_num = total_sample_num + num1 + num2
+    sample_geo_tensor = torch.cat((sample_geo_tensor, torch.tensor(sample_edge, dtype=torch.float32)), 0)
+    sample_geo_tensor = torch.cat((sample_geo_tensor, torch.tensor(sample_surface, dtype=torch.float32)), 0)
+    # 网格采样
+    sample_mesh = sample_points_from_meshes(trg_mesh, total_sample_num)
+    loss_chamfer = chamfer_distance(sample_mesh.squeeze(0), sample_geo_tensor)
+    # 计算损失
+    return loss_chamfer
+
 
 
 def geo_match_loss(trg_mesh, src_geo):
@@ -15,7 +62,7 @@ def geo_match_loss(trg_mesh, src_geo):
     mesh_verts = trg_mesh.verts_packed()
     had_matched = torch.tensor([], dtype=torch.int)
     # 匹配几何点
-    Match.match_geo_vert(trg_mesh, src_geo, [])
+    Match.match_geo_vert(trg_mesh, src_geo)
     matched_pnt = []
     # 提取出几何点匹配数据
     for key, value in src_geo.vertexs.items():

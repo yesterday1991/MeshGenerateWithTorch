@@ -27,14 +27,8 @@ def save_obj(filepath, verts, faces):
 def read_obj(filepath):
     """
     读取一个 .obj 文件，并返回顶点和面信息。
-
-    参数:
-        filepath (str): .obj 文件的路径。
-        device (str): 顶点和面的张量放置的设备（如 'cpu' 或 'cuda'）。
-
-    返回:
-        verts (torch.Tensor): 顶点坐标，形状为 (V, 3)。
-        faces (torch.Tensor): 面的顶点索引，形状为 (F, 3)。
+    :param filepath: obj 文件的路径。
+    :return:  verts (torch.Tensor): 顶点坐标，形状为 (V, 3),  faces (torch.Tensor): 面的顶点索引，形状为 (F, 3)。
     """
     verts = []
     faces = []
@@ -55,7 +49,7 @@ def read_obj(filepath):
                 # 将 .obj 的 1-based 索引转为 0-based 索引
                 faces.append([int(part.split('/')[0]) - 1 for part in parts[1:4]])
 
-    # 转换为 PyTorch 张量并放置在指定设备上
+    # 转换为 PyTorch 张量
     verts = torch.tensor(verts, dtype=torch.float32)
     faces = torch.tensor(faces, dtype=torch.int64)
 
