@@ -26,6 +26,8 @@ import math
 geo_eps = 1e-4
 # 判断面之间是否连续的角度
 continuity_face_angel = 0.94
+# 判定小边条件，为与工作网格尺寸的比例
+small_edge_ratio = 0.5
 
 def pnt_in_polygon(u, v, polygon):
     """
@@ -588,14 +590,19 @@ class OccGeo:
         self.update_surfaces_area()
         self.get_mesh_length()
         print("读取几何完成, 开始几何采样")
+        # 面积极小面
+        self.delete_small_face()
+        # 长度极小边
         self.delete_small_edge()
+        # 距离相近的点
+        self.delete_closed_vertex()
 
         # 计算每条线相接曲面的连续性
         self.no_continuity_edge = np.array([], dtype=np.int64)
         self.no_continuity_vert = np.array([], dtype=np.int64)
         self.get_continuity_face()
         self.mesh_graph = 0
-        # 按照网格数量计算采样点
+
         # 按照网格数量计算采样点画图
         self.mesh_num_in_edge()
         self.mesh_num_in_face()
@@ -786,37 +793,92 @@ class OccGeo:
         :param dim:     几何维度
         """
         if dim == 0:
+            # 删除拓扑关系
+            delete_pnt = self.vertexs[index]
+            delete_pnt_curve = delete_pnt.belong_curve_index
+            for i in delete_pnt_curve:
+                for j in range(2):
+                    if self.edges[i].end_pnt_index[j] == index:
+                        self.edges[i].end_pnt_index[j] = -1
+            # 删除点
             self.vertexs.pop(index)
             self.num_vertex -= 1
         if dim == 1:
+            # 解除与删除边关联的点的拓扑关系
+            delete_edge = self.edges[index]
+            end_pnt = delete_edge.end_pnt_index
+            for i in end_pnt:
+                if i != -1:
+                    self.vertexs[i].belong_curve_index = [x for x in self.vertexs[i].belong_curve_index if x != index]
+            # 解除与删除边关联的面的拓扑关系
+            for i in delete_edge.belong_face_index:
+                self.faces[i].contain_edge_index = [x for x in self.faces[i].contain_edge_index if x != index]
+                # self.faces[i].outwire_edge_index = [x for x in self.faces[i].outwire_edge_index if x != index]
             self.edges.pop(index)
             self.num_edge -= 1
         if dim == 2:
+            # 解除与删除面关联的边的拓扑关系
+            delete_face = self.faces[index]
+            wire_edge = delete_face.contain_edge_index
+            for i in wire_edge:
+                self.edges[i].belong_face_index = [x for x in self.edges[i].belong_face_index if x != index]
             self.faces.pop(index)
             self.num_face -= 1
 
+    def delete_small_face(self):
+        """
+        删除几何中的极小面
+        """
+        delete_face = []
+        for key, value in self.faces.items():
+            face_area = value.surface_area
+            if face_area < math.pow(self.mesh_edge_len * small_edge_ratio, 2):
+                delete_face.append(key)
+        if len(delete_face) != 0:
+            print("找到面积极小面并删除：", delete_face)
+            for small in delete_face:
+                self.delete_geo(small, 2)
+
+
     def delete_small_edge(self):
         """
-        删除几何中打的短边
+        删除几何中的短边
         """
         delete_edge = []
         for key, value in self.edges.items():
-            topo_edge = value.edge
-            edge_length = get_edge_length(topo_edge)
-            if edge_length < self.mesh_edge_len * 0.5:
-                # 处理线两端点的合并
-                v1_index = value.end_pnt_index[0]
-                v2_index = value.end_pnt_index[1]
-                pnt1 = self.vertexs[v1_index]
-                pnt2 = self.vertexs[v2_index]
-                self.merge_closed_pnt(pnt1, pnt2)
-                # 删除面中包含的该短边的编号
-                for i in value.belong_face_index:
-                    self.faces[i].contain_edge_index = [x for x in self.faces[i].contain_edge_index if x != value.index]
+            edge_length = value.curve_length
+            if edge_length < self.mesh_edge_len * small_edge_ratio:
                 # 删除短边
-                delete_edge.append(value.index)
-        for small in delete_edge:
-            self.delete_geo(small, 1)
+                delete_edge.append(key)
+        if len(delete_edge) != 0:
+            print("找到长度极小边并删除：", delete_edge)
+            for small in delete_edge:
+                self.delete_geo(small, 1)
+
+
+    def delete_closed_vertex(self):
+        """
+        删除几何中的距离相近点
+        """
+        all_keys = []
+        had_delete = []
+        # 统计编号
+        for key in self.vertexs:
+            all_keys.append(key)
+        for i in range(self.num_vertex):
+            if all_keys[i] in had_delete:
+                continue
+            pnt1 = self.vertexs[all_keys[i]]
+            for j in range(i+1, self.num_vertex):
+                if all_keys[j] in had_delete:
+                    continue
+                pnt2 = self.vertexs[all_keys[j]]
+                dist = pnt1.pnt.Distance(pnt2.pnt)
+                if dist < self.mesh_edge_len * 0.2:
+                    self.merge_closed_pnt(pnt1, pnt2)
+                    had_delete.append(all_keys[j])
+        print("找到距离相近的点并删除：", had_delete)
+
 
     def merge_closed_pnt(self, point1, point2):
         """
@@ -824,26 +886,19 @@ class OccGeo:
         :param point1:      点1
         :param point2:      点2
         """
-        pnt1_gp = point1.pnt
-        pnt2_gp = point2.pnt
-        dist = pnt1_gp.Distance(pnt2_gp)
-        if dist < 0.5 * self.mesh_edge_len:
-            reserve_pnt_index = point1.index
-            delete_pnt_index = point2.index
-            delete_pnt_curve = point2.belong_curve_index
-            # 修改pnt2相关的边关系
-            for i in delete_pnt_curve:
-                modify_edge = self.edges[i]
-                # 修改pnt2相关的线的端点至pnt1
-                if modify_edge.end_pnt_index[0] == delete_pnt_index:
-                    new_end_pnt = [reserve_pnt_index, modify_edge.end_pnt_index[1]]
-                elif modify_edge.end_pnt_index[1] == delete_pnt_index:
-                    new_end_pnt = [modify_edge.end_pnt_index[0], reserve_pnt_index]
-                self.edges[i].end_pnt_index = new_end_pnt
-            # 增加pnt2的关系至pnt1
-            belong_curve = np.unique(np.append(point2.belong_curve_index, point1.belong_curve_index))
-            self.vertexs[reserve_pnt_index].belong_curve_index = belong_curve
-            self.delete_geo(delete_pnt_index, 0)
+        reserve_pnt_index = point1.index
+        delete_pnt_index = point2.index
+        delete_pnt_curve = point2.belong_curve_index
+        # 修改pnt2相关的边关系
+        for i in delete_pnt_curve:
+            # 修改pnt2相关的线的端点至pnt1
+            for j in range(2):
+                if self.edges[i].end_pnt_index[j] == delete_pnt_index:
+                    self.edges[i].end_pnt_index[j] = reserve_pnt_index
+        # 增加pnt2的关系至pnt1
+        belong_curve = np.unique(np.append(point2.belong_curve_index, point1.belong_curve_index))
+        self.vertexs[reserve_pnt_index].belong_curve_index = belong_curve
+        self.delete_geo(delete_pnt_index, 0)
 
     # 根据网格长度对模型中边界进行采样
     def sample_uniform_in_crv(self, multiple):

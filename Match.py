@@ -2,7 +2,6 @@ from OCC.Core.gp import gp_Pnt
 import MyGeometry
 import torch
 
-
 class MyGraph:
     """
     构建图用于求几何边在网格上对应的网格点
@@ -101,7 +100,6 @@ def create_mesh_graph(mesh, geo):
         geo.mesh_graph.add_edge(edges_packed[i][0], edges_packed[i][1], 1)
 
 
-
 def match_pnt_to_mesh(src_mesh, pnt, had_match):
     """
     以最短距离为标准匹配pnt在网格中对应的网格节点
@@ -178,7 +176,7 @@ def match_no_continuity_Edge(mesh, geo):
             index1 = pnt1.match_mesh_vert
             index2 = pnt2.match_mesh_vert
             shortest_path = graph.dijkstra(index1, index2)
-            geo.edges[key].shortest_path = shortest_path[1:-1]
+            geo.edges[key].shortest_path = shortest_path
             value.SampleEdge(len(shortest_path) - 2)
 
 
@@ -204,9 +202,10 @@ def match_and_proj_final_mesh(mesh, geo):
     match_no_continuity_Edge(mesh, geo)
     for key, value in geo.edges.items():
         if key in geo.no_continuity_edge:
-            for i in range(len(value.shortest_path)):
-                final_mesh_local[value.shortest_path[i]] = torch.tensor(value.shortest_path_sample[i])
-                final_match.append(value.shortest_path[i])
+            except_end_path = value.shortest_path[1: -1]
+            for i in range(len(except_end_path)):
+                final_mesh_local[except_end_path[i]] = torch.tensor(value.shortest_path_sample[i])
+                final_match.append(except_end_path[i])
     # 面投影
     for j in range(verts_num):
         if j in final_match:

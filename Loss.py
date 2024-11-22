@@ -75,7 +75,8 @@ def geo_match_loss(trg_mesh, src_geo):
     # 获取边匹配数据
     for key, value in src_geo.edges.items():
         if key in src_geo.no_continuity_edge:
-            had_matched = torch.cat([had_matched, torch.tensor(value.shortest_path, dtype=torch.int)])
+            path_tensor = torch.tensor(value.shortest_path[1: -1], dtype=torch.int)
+            had_matched = torch.cat([had_matched, path_tensor])
             for xyz in value.shortest_path_sample:
                 matched_pnt.append(xyz)
     # 计算损失
@@ -156,28 +157,72 @@ def edge_length_loss(mesh):
     return edge_loss
 
 
-def laplacian_smoothing_loss(mesh):
+
+def laplacian_smoothing_loss(mesh, model):
     """
     基于统一矩阵的拉普拉斯平滑损失实现
     :param mesh:  网格
+    :param model: 模式 1:Uniform拉普拉斯矩阵 2:Cotangent 权重拉普拉斯矩阵
     :return:      计算损失
     """
 
     verts = mesh.verts_packed()  # 获取顶点
     edges = mesh.edges_packed()  # 获取边
-
-    # 构建稀疏邻接矩阵
+    faces= mesh.faces_packed() # 获取面
     num_verts = verts.shape[0]
-    indices = torch.cat([edges, edges.flip(1)], dim=0).t()
-    values = torch.ones(indices.shape[1], device=verts.device)
-    adj_matrix = torch.sparse_coo_tensor(indices, values, (num_verts, num_verts))
+    num_faces = faces.shape[0]
+    # 构建拉普拉斯矩阵
+    if model == 1:
+        #L[i, j] =    -1       , if i == j
+        #L[i, j] = 1 / deg(i)  , if (i, j) is an edge
+        #L[i, j] =    0        , otherwise
+        # 1. 创建邻接矩阵 A
+        indices = torch.cat([edges, edges.flip(1)], dim=0).t()
+        values = torch.ones(indices.shape[1], device=verts.device)       # Uniform 初始权重为 1
+        adj_matrix = torch.sparse_coo_tensor(indices, values, (num_verts, num_verts))
 
-    # 计算邻居均值位置
-    degree_matrix = torch.sparse.sum(adj_matrix, dim=1).to_dense().unsqueeze(1)  # 度矩阵
-    neighbor_sum = torch.sparse.mm(adj_matrix, verts)  # 邻居顶点的坐标和
-    neighbor_mean = neighbor_sum / degree_matrix.clamp(min=1)  # 邻居均值位置，避免除0
+        # 2. 计算度数矩阵D,并归一化
+        degree = torch.sparse.sum(adj_matrix, dim=1).to_dense()
+        degree_inv = torch.where(degree > 0, 1.0 / degree, torch.zeros_like(degree))
+        e0, e1 = edges.unbind(1)
+        normalized_values = torch.cat([degree_inv[e0], degree_inv[e1]])
+        normalized_adj_matrix = torch.sparse_coo_tensor(indices,normalized_values, (num_verts, num_verts))
 
-    # 计算每个顶点到邻居均值的差距
-    laplacian_loss = torch.norm(verts - neighbor_mean, p=2, dim=1).pow(2).mean()
-
-    return laplacian_loss
+        # 计算归一化的拉普拉斯矩阵 L = D - A
+        laplacian_matrix = normalized_adj_matrix - torch.sparse_coo_tensor(
+            indices=torch.stack([torch.arange(num_verts), torch.arange(num_verts)]),
+            values=torch.ones(num_verts),
+            size=(num_verts, num_verts)
+        )
+        loss = torch.sum(laplacian_matrix.mm(verts).norm(dim=1), dim=0) / num_verts
+    elif model == 2:
+        # 计算每条边的cotangent权重
+        face_verts = verts[faces]
+        # 三角形三个顶点与三条边长
+        # a - v0,      b - v1,        c - v2
+        v0, v1, v2 = face_verts[:, 0], face_verts[:, 1], face_verts[:, 2]
+        a = (v1 - v2).norm(dim=1)
+        b = (v0 - v2).norm(dim=1)
+        c = (v0 - v1).norm(dim=1)
+        # 两个三角形面积面积公式可得到每个角度的cot值
+        # 公式1 area = sqrt(S(S-a)(S-b)(S-c)) S = (a+b+c)/2
+        s = (a + b + c) / 2
+        area = (s * (s - a) * (s - b) * (s - c)).sqrt()
+        # 公式2 4area = (a*a + b*b - c*c) / cotA = (b*b + c*c - a*a) / cotB = (a*a + c*c - b*b) / cotC
+        cota = (b * b + c * c - a * a) / (4 * area)
+        cotb = (a * a + c * c - b * b) / (4 * area)
+        cotc = (a * a + b * b - c * c) / (4 * area)
+        cot = torch.stack([cota, cotb, cotc], dim=1)
+        # 1. 创建邻接矩阵 A
+        ii = faces[:, [1, 2, 0]]
+        jj = faces[:, [2, 0, 1]]
+        idx = torch.stack([ii, jj], dim=0).view(2, num_faces * 3)
+        adj_matrix = torch.sparse_coo_tensor(idx, cot.view(-1), (num_verts, num_verts))
+        adj_matrix = adj_matrix + adj_matrix.t()      # 对称矩阵
+        #  2. 计算度数矩阵D
+        degree = torch.sparse.sum(adj_matrix, dim=1).to_dense().view(-1, 1)
+        idx = degree > 0
+        degree[idx] = 1.0 / degree[idx]
+        loss = adj_matrix.mm(verts) * degree - verts
+        loss = torch.norm(loss, dim=1).mean()
+    return loss

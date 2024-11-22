@@ -10,7 +10,7 @@ from pytorch3d.loss import mesh_normal_consistency
 import time
 
 
-abc = False
+abc = True
 # abc_data库里的几何存在单位，在occ读取的任意坐标数据为i中的1000倍，为了画图这里进行缩小
 if abc:
     global_scale = 0.001
@@ -34,10 +34,10 @@ deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, req
 
 # 几何文件名
 # file_name = "cube.step"
-# file_name = "visor.step"
+file_name = "visor.step"
 # file_name = "Part 3.step"
-file_name = "new_part4.step"
-
+# file_name = "new_part3.step"
+# file_name = "dirty_cube.step"
 # 设置网格尺寸
 mesh_vert_num = len(src_mesh.verts_packed())  # 初始网格顶点数
 
@@ -53,7 +53,7 @@ final_translation = torch.tensor([geo.center.X(), geo.center.Y(), geo.center.Z()
 optimizer = torch.optim.SGD([deform_verts], lr=1, momentum=0.9)  # Adam([deform_verts], lr=0.01) #
 
 # Number of optimization steps
-Niter = 500
+Niter = 400
 
 # Weight for the chamfer loss
 w_chamfer = 1
@@ -87,19 +87,20 @@ for i in range(Niter):
 
     # 计算损失函数
     loss_edge_length = Loss.edge_length_loss(new_src_mesh)
-    loss_angle = Loss.mesh_angle_loss(new_src_mesh, torch.pi / 3)
     loss_normal = mesh_normal_consistency(new_src_mesh)
-    loss_laplacian = Loss.laplacian_smoothing_loss(new_src_mesh)
-    if i < 400:
-        loss_chamfer = Loss.geo_chamfer_loss(new_src_mesh, geo)
-        # loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
+    loss_laplacian = Loss.laplacian_smoothing_loss(new_src_mesh, 2)
+    loss_angle = Loss.mesh_angle_loss(new_src_mesh, torch.pi / 3)
+
+    if i < 300:
+        # loss_chamfer = Loss.geo_chamfer_loss(new_src_mesh, geo)
+        loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
         total_loss = (
-                     loss_angle * w_angle + loss_edge_length * w_edge_length + loss_chamfer * w_chamfer +
-                    loss_normal * w_normal + loss_laplacian * w_laplacian)  #  loss_surface * w_surface +
-        print(i, loss_chamfer, loss_angle, loss_edge_length, loss_normal, loss_laplacian)
-        chamfer_losses.append(float(loss_chamfer.detach().cpu()))
+                     loss_angle * w_angle + loss_edge_length * w_edge_length + loss_surface * w_surface +
+                    loss_normal * w_normal + loss_laplacian * w_laplacian)  #   loss_chamfer * w_chamfer+
+        print(i, loss_surface, loss_angle, loss_edge_length, loss_normal, loss_laplacian)
+        # chamfer_losses.append(float(loss_chamfer.detach().cpu()))
         match_edge_losses.append(0)
-        # surface_losses.append(float(loss_surface.detach().cpu()))
+        surface_losses.append(float(loss_surface.detach().cpu()))
     else:
         loss_edge_match = Loss.geo_match_loss(new_src_mesh, geo)
         loss_surface = Loss.geo_proj_surface_loss(new_src_mesh, geo)
