@@ -1,8 +1,7 @@
 
 import torch
 import torch.nn as nn
-from MyGeometry import project_mesh_vert_to_geo
-import Match
+import MyGeometry
 from pytorch3d.ops import sample_points_from_meshes
 
 
@@ -59,29 +58,23 @@ def geo_match_loss(trg_mesh, src_geo):
     :param src_geo:     几何
     :return:            计算损失
     """
-    mesh_verts = trg_mesh.verts_packed()
-    had_matched = torch.tensor([], dtype=torch.int)
-    # 匹配几何点
-    Match.match_geo_vert(trg_mesh, src_geo)
+
+    # 在边界上的网格点
+    match_pnt = src_geo.edge_mesh_index
+    # 找到网格点所对应的采样点
     matched_pnt = []
-    # 提取出几何点匹配数据
-    for key, value in src_geo.vertexs.items():
-        had_matched = torch.cat([had_matched, torch.tensor([value.match_mesh_vert], dtype=torch.int)])
-        matched_pnt.append(value.GetPntXYZ())
-    # 更新网格点到各个边的距离，作为图的权重
-    Match.update_mesh_vert_to_edge_dist(trg_mesh, src_geo)
-    # 利用最短路径去匹配边
-    Match.match_no_continuity_Edge(trg_mesh, src_geo)
-    # 获取边匹配数据
-    for key, value in src_geo.edges.items():
-        if key in src_geo.no_continuity_edge:
-            path_tensor = torch.tensor(value.shortest_path[1: -1], dtype=torch.int)
-            had_matched = torch.cat([had_matched, path_tensor])
-            for xyz in value.shortest_path_sample:
-                matched_pnt.append(xyz)
-    # 计算损失
+    for mesh_index in match_pnt:
+        for key, value in src_geo.edges.items():
+            if mesh_index in value.shortest_path:
+                tmp_index = value.shortest_path.index(mesh_index)
+                pnt_xyz = value.shortest_path_sample[tmp_index]
+                matched_pnt.append(pnt_xyz)
+                break
+
     matched_pnt_tensor = torch.tensor(matched_pnt)
-    match_verts_tensor = mesh_verts[had_matched]
+    # 网格点
+    mesh_verts = trg_mesh.verts_packed()
+    match_verts_tensor = mesh_verts[match_pnt]
     mseloss = nn.MSELoss()
     mean_loss = mseloss(match_verts_tensor, matched_pnt_tensor)
     return mean_loss
@@ -93,12 +86,27 @@ def geo_proj_surface_loss(trg_mesh, src_geo):
     :param src_geo:     几何
     :return:            损失（平均距离）
     """
+
+    # 获取投影点
+    if src_geo.proj_all_face:
+        tensor_pnts = torch.Tensor(MyGeometry.project_mesh_to_geo(trg_mesh, src_geo))
+    else:
+        tensor_pnts = torch.Tensor(MyGeometry.mapping_pnt_to_geo(trg_mesh, src_geo, 2))
+
+    # 网格点
     verts = trg_mesh.verts_packed()
-    # 找到网格顶点对应投影点位置
-    tensor_pnts = torch.Tensor(project_mesh_vert_to_geo(verts, src_geo))
+    # 找到内部点
+    inside_mesh_pnt_index = src_geo.face_mesh_index
+    # 找到内部点投影的坐标
+    tensor_pnts = tensor_pnts[inside_mesh_pnt_index]
+    # 找到内部点原始的坐标
+    proj_mesh_vert = verts[inside_mesh_pnt_index]
     # 网格点与投影点计算损失
-    loss = nn.MSELoss()
-    mean_loss = loss(verts, tensor_pnts)
+    loss = nn.MSELoss(reduction='none')
+    total_loss = loss(proj_mesh_vert, tensor_pnts)
+    weighted_loss = total_loss.sum(dim=1)
+    # Draw.plot_two_point(proj_mesh_vert.detach().numpy(), tensor_pnts.detach().numpy())
+    mean_loss = torch.mean(weighted_loss)
     return mean_loss
 
 def count_mesh_angle(mesh):
@@ -157,6 +165,38 @@ def edge_length_loss(mesh):
     return edge_loss
 
 
+def compute_cotangent_weights(mesh):
+
+    verts = mesh.verts_packed()  # 获取顶点
+    faces= mesh.faces_packed() # 获取面
+    num_verts = verts.shape[0]
+    num_faces = faces.shape[0]
+    # 计算每条边的cotangent权重
+    face_verts = verts[faces]
+    # 三角形三个顶点与三条边长
+    # a - v0,      b - v1,        c - v2
+    v0, v1, v2 = face_verts[:, 0], face_verts[:, 1], face_verts[:, 2]
+    a = (v1 - v2).norm(dim=1)
+    b = (v0 - v2).norm(dim=1)
+    c = (v0 - v1).norm(dim=1)
+    # 两个三角形面积面积公式可得到每个角度的cot值
+    # 公式1 area = sqrt(S(S-a)(S-b)(S-c)) S = (a+b+c)/2
+    s = (a + b + c) / 2
+    area = (s * (s - a) * (s - b) * (s - c)).sqrt()
+    # 公式2 4area = (a*a + b*b - c*c) / cotA = (b*b + c*c - a*a) / cotB = (a*a + c*c - b*b) / cotC
+    cota = (b * b + c * c - a * a) / (4 * area)
+    cotb = (a * a + c * c - b * b) / (4 * area)
+    cotc = (a * a + b * b - c * c) / (4 * area)
+    cot = torch.stack([cota, cotb, cotc], dim=1)
+    # 1. 创建邻接矩阵 A
+    ii = faces[:, [1, 2, 0]]
+    jj = faces[:, [2, 0, 1]]
+    idx = torch.stack([ii, jj], dim=0).view(2, num_faces * 3)
+    adj_matrix = torch.sparse_coo_tensor(idx, cot.view(-1), (num_verts, num_verts))
+    adj_matrix = adj_matrix + adj_matrix.t()  # 对称矩阵
+    return adj_matrix
+
+
 
 def laplacian_smoothing_loss(mesh, model):
     """
@@ -196,29 +236,8 @@ def laplacian_smoothing_loss(mesh, model):
         )
         loss = torch.sum(laplacian_matrix.mm(verts).norm(dim=1), dim=0) / num_verts
     elif model == 2:
-        # 计算每条边的cotangent权重
-        face_verts = verts[faces]
-        # 三角形三个顶点与三条边长
-        # a - v0,      b - v1,        c - v2
-        v0, v1, v2 = face_verts[:, 0], face_verts[:, 1], face_verts[:, 2]
-        a = (v1 - v2).norm(dim=1)
-        b = (v0 - v2).norm(dim=1)
-        c = (v0 - v1).norm(dim=1)
-        # 两个三角形面积面积公式可得到每个角度的cot值
-        # 公式1 area = sqrt(S(S-a)(S-b)(S-c)) S = (a+b+c)/2
-        s = (a + b + c) / 2
-        area = (s * (s - a) * (s - b) * (s - c)).sqrt()
-        # 公式2 4area = (a*a + b*b - c*c) / cotA = (b*b + c*c - a*a) / cotB = (a*a + c*c - b*b) / cotC
-        cota = (b * b + c * c - a * a) / (4 * area)
-        cotb = (a * a + c * c - b * b) / (4 * area)
-        cotc = (a * a + b * b - c * c) / (4 * area)
-        cot = torch.stack([cota, cotb, cotc], dim=1)
         # 1. 创建邻接矩阵 A
-        ii = faces[:, [1, 2, 0]]
-        jj = faces[:, [2, 0, 1]]
-        idx = torch.stack([ii, jj], dim=0).view(2, num_faces * 3)
-        adj_matrix = torch.sparse_coo_tensor(idx, cot.view(-1), (num_verts, num_verts))
-        adj_matrix = adj_matrix + adj_matrix.t()      # 对称矩阵
+        adj_matrix = compute_cotangent_weights(mesh)
         #  2. 计算度数矩阵D
         degree = torch.sparse.sum(adj_matrix, dim=1).to_dense().view(-1, 1)
         idx = degree > 0

@@ -1,6 +1,9 @@
 from OCC.Core.gp import gp_Pnt
 import MyGeometry
 import torch
+import networkx as nx
+
+use_networkx = True
 
 class MyGraph:
     """
@@ -80,6 +83,7 @@ class MyGraph:
 
         return None     # 如果没有路径则返回
 
+
 def create_mesh_graph(mesh, geo):
     """
     创建点权重全为1，边权重为0的图
@@ -87,17 +91,24 @@ def create_mesh_graph(mesh, geo):
     :param geo:         几何
     :return:
     """
-    geo.mesh_graph = MyGraph()
     verts = mesh.verts_packed()
     verts_num = verts.shape[0]
     edges_packed = mesh.edges_packed().tolist()
     edge_num = len(edges_packed)
-    # 添加节点和节点权重
-    for i in range(verts_num):
-        geo.mesh_graph.add_node(i)
-    # # # 添加边
-    for i in range(edge_num):
-        geo.mesh_graph.add_edge(edges_packed[i][0], edges_packed[i][1], 1)
+    if use_networkx:
+        geo.mesh_graph = nx.Graph()
+        # 添加节点和节点权重
+        for i in range(verts_num):
+            geo.mesh_graph.add_node(i)
+        # # # 添加边
+        for i in range(edge_num):
+            geo.mesh_graph.add_edge(edges_packed[i][0], edges_packed[i][1])
+    else:
+        geo.mesh_graph = MyGraph()
+        for i in range(verts_num):
+            geo.mesh_graph.add_node(i)
+        for i in range(edge_num):
+            geo.mesh_graph.add_edge(edges_packed[i][0], edges_packed[i][1], 1)
 
 
 def match_pnt_to_mesh(src_mesh, pnt, had_match):
@@ -131,9 +142,14 @@ def match_geo_vert(mesh, geo):
     :param mesh:            网格
     :param geo:             几何
     """
+    total_match = []
     for key, value in geo.vertexs.items():
         pnt = value.GetPntXYZ()
-        matched = match_pnt_to_mesh(mesh, pnt, [])
+        matched = match_pnt_to_mesh(mesh, pnt, total_match)
+        if matched not in total_match:
+            total_match.append(matched)
+        else:
+            print("matched error")
         geo.vertexs[key].match_mesh_vert = matched
 
 
@@ -168,25 +184,26 @@ def match_no_continuity_Edge(mesh, geo):
             for i in range(edge_num):
                 mesh_index0 = edges_packed[i][0]
                 mesh_index1 = edges_packed[i][1]
-                graph.update_edge_weight(mesh_index0, mesh_index1, weight[mesh_index0] + weight[mesh_index1])
+                if use_networkx:
+                    graph[mesh_index0][mesh_index1]['weight'] = weight[mesh_index0] + weight[mesh_index1]
+                else:
+                    graph.update_edge_weight(mesh_index0, mesh_index1, weight[mesh_index0] + weight[mesh_index1])
             # 找到该边的两个顶点
             pnt1 = geo.vertexs[value.end_pnt_index[0]]
             pnt2 = geo.vertexs[value.end_pnt_index[1]]
             # 两个顶点所对应的网格点编号
             index1 = pnt1.match_mesh_vert
             index2 = pnt2.match_mesh_vert
-            shortest_path = graph.dijkstra(index1, index2)
+            if use_networkx:
+                shortest_path = nx.dijkstra_path(graph, source=index1, target=index2)
+            else:
+                shortest_path = graph.dijkstra(index1, index2)
             geo.edges[key].shortest_path = shortest_path
             value.SampleEdge(len(shortest_path) - 2)
 
 
 def match_and_proj_final_mesh(mesh, geo):
-    """
-    最终几何贴体
-    :param mesh:    网格
-    :param geo:     几何
-    :return:        经过匹配投影最终网格坐标tensor
-    """
+
     verts = mesh.verts_packed()
     verts_num = verts.shape[0]
     final_mesh_local = verts.clone()
