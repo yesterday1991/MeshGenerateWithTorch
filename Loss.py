@@ -1,6 +1,8 @@
 
 import torch
 import torch.nn as nn
+
+import Draw
 import MyGeometry
 from pytorch3d.ops import sample_points_from_meshes
 
@@ -36,17 +38,13 @@ def geo_chamfer_loss(trg_mesh, src_geo):
     :return:                损失
     """
     # 几何离散采样
-    total_sample_num = src_geo.num_vertex
-    sample_geo_tensor = torch.tensor(src_geo.get_all_pnt_xyz(), dtype=torch.float32)
-    num1, sample_edge = src_geo.sample_uniform_in_crv(1)
-    num2, sample_surface = src_geo.sample_in_surface(4)
-    total_sample_num = total_sample_num + num1 + num2
-    sample_geo_tensor = torch.cat((sample_geo_tensor, torch.tensor(sample_edge, dtype=torch.float32)), 0)
-    sample_geo_tensor = torch.cat((sample_geo_tensor, torch.tensor(sample_surface, dtype=torch.float32)), 0)
+    total_sample_num = src_geo.mesh_vert_num * 2
+    sample_geo = src_geo.sample_geo(total_sample_num)
+    sample_geo_tensor = torch.tensor(sample_geo, dtype=torch.float32)
     # 网格采样
     sample_mesh = sample_points_from_meshes(trg_mesh, total_sample_num)
-    loss_chamfer = chamfer_distance(sample_mesh.squeeze(0), sample_geo_tensor)
     # 计算损失
+    loss_chamfer = chamfer_distance(sample_mesh.squeeze(0), sample_geo_tensor)
     return loss_chamfer
 
 
@@ -79,6 +77,7 @@ def geo_match_loss(trg_mesh, src_geo):
     mean_loss = mseloss(match_verts_tensor, matched_pnt_tensor)
     return mean_loss
 
+
 def geo_proj_surface_loss(trg_mesh, src_geo):
     """
     以投影为计算方法，得到网格点到面的距离损失计算
@@ -88,19 +87,21 @@ def geo_proj_surface_loss(trg_mesh, src_geo):
     """
 
     # 获取投影点
-    if src_geo.proj_all_face:
-        tensor_pnts = torch.Tensor(MyGeometry.project_mesh_to_geo(trg_mesh, src_geo))
-    else:
+    if src_geo.using_map:
         tensor_pnts = torch.Tensor(MyGeometry.mapping_pnt_to_geo(trg_mesh, src_geo, 2))
-
+        print("using mapping")
+    else:
+        tensor_pnts = torch.Tensor(MyGeometry.project_mesh_to_geo(trg_mesh, src_geo))
+        print("using projection")
     # 网格点
-    verts = trg_mesh.verts_packed()
+    proj_mesh_vert = trg_mesh.verts_packed()
     # 找到内部点
-    inside_mesh_pnt_index = src_geo.face_mesh_index
-    # 找到内部点投影的坐标
-    tensor_pnts = tensor_pnts[inside_mesh_pnt_index]
-    # 找到内部点原始的坐标
-    proj_mesh_vert = verts[inside_mesh_pnt_index]
+    if src_geo.using_map:
+        inside_mesh_pnt_index = src_geo.face_mesh_index
+        # 找到内部点投影的坐标
+        tensor_pnts = tensor_pnts[inside_mesh_pnt_index]
+        # 找到内部点原始的坐标
+        proj_mesh_vert = proj_mesh_vert[inside_mesh_pnt_index]
     # 网格点与投影点计算损失
     loss = nn.MSELoss(reduction='none')
     total_loss = loss(proj_mesh_vert, tensor_pnts)

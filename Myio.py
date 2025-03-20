@@ -49,10 +49,6 @@ def read_obj(filepath):
                 # 将 .obj 的 1-based 索引转为 0-based 索引
                 faces.append([int(part.split('/')[0]) - 1 for part in parts[1:4]])
 
-    # 转换为 PyTorch 张量
-    verts = torch.tensor(verts, dtype=torch.float32)
-    faces = torch.tensor(faces, dtype=torch.int64)
-
     return verts, faces
 
 
@@ -109,8 +105,9 @@ def generate_icosphere(level=0, device=None):
             ])
         faces = new_faces  # 更新面列表
 
-    # 转换为 PyTorch 张量
-    verts = torch.tensor(verts, dtype=torch.float32, device=device)
-    faces = torch.tensor(faces, dtype=torch.int64, device=device)
+    # # 转换为 PyTorch 张量
+    # verts = torch.tensor(verts, dtype=torch.float32, device=device)
+    # faces = torch.tensor(faces, dtype=torch.int64, device=device)
 
-    return Meshes(verts=[verts], faces=[faces])
+    # return Meshes(verts=[verts], faces=[faces])
+    return verts, faces

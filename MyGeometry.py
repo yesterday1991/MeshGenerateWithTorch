@@ -1,4 +1,4 @@
-
+import torch
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
@@ -25,11 +25,11 @@ import networkx as nx
 import scipy.sparse.linalg as spla
 import Draw
 import igl
-
+from collections import Counter
 
 geo_eps = 1e-4
 # 判断面之间是否连续的角度
-continuity_face_angel = 0.94
+continuity_face_angel = 0.5
 # 判定小边条件，为与工作网格尺寸的比例
 small_edge_ratio = 0.5
 
@@ -473,23 +473,29 @@ def project_mesh_to_geo(mesh, geo):
     :return:                返回投影点坐标     tensor (sum(V_n), 3)
     """
     # 更新确定进行投影或者进行匹配的网格点
-    geo.update_mesh_vert_to_face(mesh)
+    # geo.update_mesh_vert_to_face(mesh)
 
     # 网格点
     verts = mesh.verts_packed()
+    has_nan =  torch.isnan(verts).any()
+    if has_nan:
+        print("投影初始出现nan")
     # 找到内部需要进行投影的点
     # inside_mesh_pnt_index = geo.face_mesh_index
     # 投影后的坐标集合
     proj_point_xyz = []
+    for key, value in geo.faces.items():
+        value.proj_mesh_index = []
     # 统计距离
     geo.mesh_dist_to_geo = 0
     # 开始投影
-    for mesh_index in range(len(verts)):
+    for index in range(len(verts)):
         # 获取网格点坐标
-        X = verts[mesh_index][0].item()
-        Y = verts[mesh_index][1].item()
-        Z = verts[mesh_index][2].item()
+        X = verts[index][0].item()
+        Y = verts[index][1].item()
+        Z = verts[index][2].item()
         # 判断是否为nan
+
         if math.isnan(X) or math.isnan(Y) or math.isnan(Z):
             print("出现nan")
         # 初始化OCC_pnt
@@ -497,11 +503,12 @@ def project_mesh_to_geo(mesh, geo):
         # 初始化投影距离与投影点坐标
         projection_min_dist = float("inf")
         current_proj_xyz = []
+        belong_face = -1
         # 开始进行投影
-        # geo.proj_all_face = True
+        geo.proj_all_face = True
         if geo.proj_all_face:
             # 计算点到每个面的投影距离
-            for _, value in geo.faces.items():
+            for key, value in geo.faces.items():
                 face = value.face  # 拓扑面
                 # 利用拓扑面构建bnd_box,利用box之间的距离排除该面
                 box_dist = pnt_face_box_distance(projection_pnt, face)
@@ -511,15 +518,17 @@ def project_mesh_to_geo(mesh, geo):
                 if dist < projection_min_dist:
                     projection_min_dist = dist
                     current_proj_xyz = proj_point.copy()
+                    belong_face = key
             if projection_min_dist < geo_eps:  # 投影点与网格点距离接近，为同一个点
                 current_proj_xyz = [X, Y, Z]
             proj_point_xyz.append(current_proj_xyz)  # 记录全局最近坐标
+            geo.faces[belong_face].proj_mesh_index.append(index)
             geo.mesh_dist_to_geo += projection_min_dist
         else:
             # 计算点到其限定的loop内部的投影
                 for _, value in geo.shell.items():
                     # 确认该网格点是否属于该shell
-                    if mesh_index in value.inside_mesh_pnt:
+                    if index in value.inside_mesh_pnt:
                         # 投影到shell内的面上
                         for face_index in value.faces_index:
                             face = geo.faces[face_index].face
@@ -534,6 +543,17 @@ def project_mesh_to_geo(mesh, geo):
                             current_proj_xyz = [X, Y, Z]
                         proj_point_xyz.append(current_proj_xyz)  # 记录全局最近坐标
                         geo.mesh_dist_to_geo += projection_min_dist
+    # proj = np.array(proj_point_xyz)
+    # vvvv = verts.detach().cpu().numpy()
+    # for key, value in geo.faces.items():
+    #     vv = value.proj_mesh_index
+    #     v2 = vvvv[vv]
+    #     v3 = proj[vv]
+    #     Draw.plot_two_point(v2, v3)
+    proj_nan = torch.tensor(proj_point_xyz, dtype=torch.float32)
+    has_nan = torch.isnan(proj_nan).any()
+    if has_nan:
+        print("投影结果出现nan")
     return proj_point_xyz
 
 def mapping_pnt_to_geo(mesh, geo, dim):
@@ -553,7 +573,7 @@ def mapping_pnt_to_geo(mesh, geo, dim):
     final_xyz = mesh_verts.copy()
     for key, face in geo.faces.items():
         # 面内顶点
-        inside_idx = face.mesh_index
+        inside_idx = face.mapping_inside_mesh_index
         # 小面可能内部无顶点
         if len(inside_idx) == 0:
             continue
@@ -586,7 +606,6 @@ def mapping_pnt_to_geo(mesh, geo, dim):
                         boundary_idx.append(indx)
                         boundary_pos.append(uv)
                         boundary_xyz.append(xyz)
-
         boundary_pos = np.array(boundary_pos)
         boundary_xyz = np.array(boundary_xyz)
         # 面所属的网格 = 面内顶点 + 边界点
@@ -602,13 +621,13 @@ def mapping_pnt_to_geo(mesh, geo, dim):
         # 重新映射面索引
         sub_faces_local = np.vectorize(local_map.get)(sub_faces)
         # 提取局部顶点坐标
-        local_xyz = mesh_verts[face_mesh_pnt]
+        local_xyz =  mesh_verts[face_mesh_pnt]
         # 计算 Laplacian
         L = igl.cotmatrix(local_xyz, sub_faces_local)
+        # L += 1e-6 * np.eye(L.shape[0])  # 避免数值问题
         # 提取局部自由度
         L_inside = L[inside_local_idx, :][:, inside_local_idx]
         B_inside = -L[inside_local_idx, :][:, boundary_local_idx] @ boundary_pos
-
         # 线性求解 Laplacian 初始解
         if dim == 3:
             # 初始化内部点
@@ -622,7 +641,7 @@ def mapping_pnt_to_geo(mesh, geo, dim):
             V_local_init[inside_local_idx, 1] = init_y
             V_local_init[inside_local_idx, 2] = init_z
 
-            arap = igl.ARAP(local_xyz, sub_faces_local, 3, np.array([boundary_local_idx]))
+            arap = igl.ARAP(local_xyz, sub_faces_local, 3, boundary_local_idx)
             V_local_final = arap.solve(boundary_pos, V_local_init)
             # 将局部结果映射回原始网格
             final_xyz[inside_idx] = V_local_final[inside_local_idx]
@@ -641,6 +660,7 @@ def mapping_pnt_to_geo(mesh, geo, dim):
             # 运行 ARAP 优化，仅对局部网格求解
             arap = igl.ARAP(V_local_uv, sub_faces_local, 2, np.array([boundary_local_idx]))
             V_local_uv_final = arap.solve(boundary_pos, V_local_uv)
+            # V_local_uv_final = igl.harmonic(local_xyz, sub_faces_local, boundary_local_idx, boundary_pos, 1)
             # 从内部点uv点计算面上的xyz坐标
             for i, j in zip(inside_local_idx, inside_idx):
                 uv = V_local_uv_final[i]
@@ -652,29 +672,6 @@ def mapping_pnt_to_geo(mesh, geo, dim):
             # 将边界点映射回原始网格
             final_xyz[boundary_idx] = boundary_xyz[boundary_local_idx]
     return final_xyz
-
-
-
-        # topo_edge = current_edge.edge
-            # curve_2d, first_param, last_param = BRep_Tool.CurveOnSurface(topo_edge, topo_face)  # 参数曲线信息
-            # path = current_edge.shortest_path
-            # interval = 1 / (len(path) - 1)  # 单位长度的采样间隔
-            # curve_interval = interval * (last_param - first_param)  # 当前线段上的采样间隔
-            # loc_t = first_param + np.fromiter(iter(range(len(path))), dtype=int) * curve_interval
-            # for indx, t in zip(path, loc_t):
-            #     if indx not in short_path_uv:
-            #         pnt_2d = curve_2d.Value(t)
-            #         short_path_uv[indx] = [pnt_2d.X(), pnt_2d.Y()]
-
-        # weights = compute_cotangent_weights(mesh_verts.detach().numpy(), sub_faces.numpy(), wire_mesh_pnt)
-        # # inside_mesh_uv = map_3d_to_2d(len(face_mesh_pnt), inside_mesh_pnt, weights, short_path_uv)
-        # Draw.plot_mesh(mesh, sub_faces)
-        # # print(inside_mesh_uv)
-        # print(len(inside_mesh_pnt))
-        # print(len(inside_mesh_uv))
-
-
-
 
 
 class MyVertex:
@@ -734,17 +731,25 @@ class MyEdge:
 
     def SampleEdge(self, sample_num):
         """
-        根据匹配的最短路径上网格点的数量进行采样
-        :param sample_num:      最短路径网格点数量
+        边采样
+        :param sample_num:      采样数量，包括首尾端点
+        :return:                采样点坐标
         """
-        self.shortest_path_sample = []
-        sample_interval = 1 / (sample_num - 1)                      # 单位长度的采样间隔
+        sample = []
+        if sample_num < 1:
+            return sample
+        elif sample_num == 1:
+            sample_interval = 1
+        else:
+            sample_interval = 1 / (sample_num - 1)                      # 单位长度的采样间隔
         current_curve_interval = sample_interval * (self.last - self.first)  # 当前线段上的采样间隔
         sample_loc = self.first + np.fromiter(iter(range(sample_num)), dtype=int) * current_curve_interval
         for j in range(sample_num):
             pnt = self.curve.Value(sample_loc[j])
             sample_curve_xyz = [pnt.X(), pnt.Y(), pnt.Z()]
-            self.shortest_path_sample.append(sample_curve_xyz)
+            sample.append(sample_curve_xyz)
+        return sample
+
 
 class MyFace:
     """
@@ -799,9 +804,42 @@ class MyFace:
                 self.wire_discrete_point.append(inside_wire_uv)
             exp_wire.Next()
 
-        # 获取网格编号
-        self.out_loop_path_index = []
-        self.mesh_index = []
+        # mapping获取的网格编号
+        self.mapping_loop_mesh_index = []
+        self.mapping_inside_mesh_index = []
+        # 投影获取的网格编号
+        self.proj_mesh_index = []
+
+    def SampleSurface(self, sample_num):
+        """
+        面采样
+        :param sample_num:  采样点数量
+        :return:            采样点坐标
+        """
+        sample_surfaces = []
+        if sample_num < 1:
+            return sample_surfaces
+        # wire_num = self.wire_num
+        bound = self.surfaces_bound
+        had_sample_num = 0
+        while had_sample_num < sample_num:
+            random_u = np.random.random() * (bound[1] - bound[0]) + bound[0]
+            random_v = np.random.random() * (bound[3] - bound[2]) + bound[2]
+            outwire = self.wire_discrete_point[0]
+            if not pnt_in_polygon(random_u, random_v, outwire):
+                continue
+            # if wire_num > 2:  # 继续检查内环
+            #     for m in range(1, wire_num):
+            #         current_wire = current_surface_wire[m]
+            #         if pnt_in_polygon(random_u, random_v, current_wire):
+            #             continue
+            # 检查的uv合法
+            sample_pnt_3d = self.surface.Value(random_u, random_v)
+            sample_pnt_3d_xyz = [sample_pnt_3d.X(), sample_pnt_3d.Y(), sample_pnt_3d.Z()]
+            sample_surfaces.append(sample_pnt_3d_xyz)
+            had_sample_num += 1
+        return sample_surfaces
+
 
 class MyShell:
     """
@@ -841,6 +879,7 @@ class OccGeo:
         self.num_shell = 0  # shell数量
 
         # 获取偏移量与缩放尺寸
+        self.centre = []
         self.get_offset()
         # 几何偏移与缩放
         self.transform_geo()
@@ -863,22 +902,36 @@ class OccGeo:
         self.face_mesh_index = []
         self.edge_mesh_index = []
         self.proj_all_face = False
+        self.using_map = False
         # 构建网格图
         self.mesh_graph = nx.Graph()
         # 统计网格到几何的距离总和
         self.mesh_dist_to_geo = 0
 
         # 按照网格数量计算采样点画图
-        # self.mesh_num_in_edge()
-        # self.mesh_num_in_face()
-        # self.plot_sample = np.array(self.get_all_pnt_xyz())  # 画图
-        # _, sample_edge = self.sample_uniform_in_crv(1)
-        # if len(sample_edge) != 0:
-        #     self.plot_sample = np.append(self.plot_sample, np.array(sample_edge), 0)
-        # _, sample_surface = self.sample_in_surface(1)
-        # if len(sample_surface) != 0:
-        #     self.plot_sample = np.append(self.plot_sample, np.array(sample_surface), 0)
-        # print("几何采样完成")
+        self.plot_sample = self.sample_geo(vert_num)
+        print("几何采样完成")
+
+
+    def sample_geo(self, sample_num):
+        """
+        几何采样
+        :param sample_num:  采样点数量
+        :return:            采样点坐标
+        """
+        # 计算采样点分配
+        curve_sample_num = self.mesh_num_in_edge(sample_num)
+        total_curve_sample_num = np.array(curve_sample_num).sum()
+
+        surface_sample_num = self.mesh_num_in_face(sample_num - total_curve_sample_num)
+        total_sample = np.array(self.get_all_pnt_xyz())  # 画图
+        sample_edge = self.sample_uniform_in_crv(curve_sample_num)
+        if len(sample_edge) != 0:
+            total_sample = np.append(total_sample, np.array(sample_edge), 0)
+        sample_surface = self.sample_in_surface(surface_sample_num)
+        if len(sample_surface) != 0:
+            total_sample = np.append(total_sample, np.array(sample_surface), 0)
+        return total_sample
 
     def get_all_pnt_xyz(self):
         """
@@ -895,6 +948,10 @@ class OccGeo:
         """
         获取原始几何到单位几何的偏移量与比例
         """
+        fgprop = GProp_GProps()
+        brepgprop.SurfaceProperties(self.original_geo, fgprop)
+        centroid = fgprop.CentreOfMass()
+
         bbox = Bnd_Box()
         bbox.SetGap(geo_eps)
         brepbndlib.Add(self.original_geo, bbox)
@@ -902,9 +959,10 @@ class OccGeo:
         mean_x = (shape_xmax + shape_xmin) / 2
         mean_y = (shape_ymax + shape_ymin) / 2
         mean_z = (shape_zmax + shape_zmin) / 2
-        self.center = gp_Vec(-mean_x, -mean_y, -mean_z)
+        self.center = [mean_x, mean_y, mean_z]
+        self.box = [shape_xmin, shape_ymin, shape_zmin, shape_xmax, shape_ymax, shape_zmax]
         max_box_len = max([shape_xmax - mean_x, shape_ymax - mean_y, shape_zmax - mean_z])
-        self.scale = 1 / (max_box_len * 2)
+        self.scale = 1 / (max_box_len * 2  )
 
     def transform_geo(self):
         """
@@ -912,7 +970,8 @@ class OccGeo:
         """
         # 设置几何变换矩阵
         transiation_trsf1 = gp_Trsf()
-        transiation_trsf1.SetTranslation(self.center)
+        center_vec = gp_Vec(-self.center[0], -self.center[1], -self.center[2])
+        transiation_trsf1.SetTranslation(center_vec)
         scal_base_point = gp_Pnt(0, 0, 0)
         scale_trsf = gp_Trsf()
         scale_trsf.SetScale(scal_base_point, self.scale)
@@ -983,6 +1042,8 @@ class OccGeo:
         for i in range(self.num_edge):
             self.edges[i].belong_face_index = np.array(map_edge2face[i])
 
+        print("边数量",self.num_edge, "  面数量", self.num_face)
+
     def update_surfaces_area(self):
         """
         计算所有几何面面积
@@ -1050,11 +1111,9 @@ class OccGeo:
                         else:
                             out_loop_edge_index.remove(index)
                             in_loop_edge_index.append(index)
-
             my_shell= MyShell(self.num_shell, faces, out_loop_edge_index, in_loop_edge_index)
             self.shell[self.num_shell] = my_shell  # 边
             self.num_shell += 1  # 边数量
-
 
     def update_mesh_vert_to_pnt(self, mesh):
         """
@@ -1090,9 +1149,22 @@ class OccGeo:
         根据最短路径去匹配所有边， 更新每一条边内数据shortest_path
         :param mesh: 网格
         """
+        # 按照先处理
+        continuity_edge = []
+        discontinuous = []
+        for key, value in self.edges.items():
+            if self.edges[key].is_continuity:
+                continuity_edge.append(key)
+            else:
+                discontinuous.append(key)
+        order = continuity_edge + discontinuous
+        # 去除已匹配的点
+        had_match_pnt = []
         edges_packed = mesh.edges_packed().tolist()
         edge_num = len(edges_packed)
-        for key, value in self.edges.items():
+        # for key, value in self.edges.items():
+        for key in order:
+            value = self.edges[key]
             # 权重为所有网格点到该边的距离
             weight = value.MeshVertToEdge
             # 构建关于条边的图来求两个顶点的
@@ -1101,6 +1173,9 @@ class OccGeo:
                 mesh_index0 = edges_packed[i][0]
                 mesh_index1 = edges_packed[i][1]
                 my_graph[mesh_index0][mesh_index1]['weight'] = weight[mesh_index0] + weight[mesh_index1]
+            # 去除屌已经匹配的点
+            # if len(had_match_pnt) > 0:
+            #     my_graph.remove_nodes_from(had_match_pnt)
             # 找到该边的两个顶点
             pnt1 = self.vertexs[value.end_pnt_index[0]]
             pnt2 = self.vertexs[value.end_pnt_index[1]]
@@ -1108,8 +1183,12 @@ class OccGeo:
             index1 = pnt1.match_mesh_vert
             index2 = pnt2.match_mesh_vert
             shortest_path = nx.dijkstra_path(my_graph, source=index1, target=index2)
-            value.SampleEdge(len(shortest_path))
+            # 清空数据，储存最新路径
+            value.shortest_path_sample = []
             self.edges[key].shortest_path = shortest_path
+            sample_curve_xyz = value.SampleEdge(len(shortest_path))
+            value.shortest_path_sample = sample_curve_xyz
+            had_match_pnt += shortest_path[1:-1]
 
     def update_mesh_vert_to_geo_face(self, mesh):
         """
@@ -1117,13 +1196,13 @@ class OccGeo:
         """
         for key, value in self.faces.items():
             loop = value.out_wire_index
-            value.out_loop_path_index = []
+            value.mapping_loop_mesh_index = []
             for edge_index in loop:
                 edge_path = self.edges[edge_index].shortest_path
-                value.out_loop_path_index += [index for index in edge_path if index not in value.out_loop_path_index]
+                value.mapping_loop_mesh_index += [index for index in edge_path if index not in value.mapping_loop_mesh_index]
             # 从图中删除loop中的网格点
             my_graph = self.mesh_graph.copy()
-            my_graph.remove_nodes_from(value.out_loop_path_index)
+            my_graph.remove_nodes_from(value.mapping_loop_mesh_index)
             # 获取删除loop中的节点的子图
             sub_graphs = []
             for sub in nx.connected_components(my_graph):
@@ -1133,10 +1212,17 @@ class OccGeo:
             # 除去最大子图中的节点剩余的为该大面的节点
             if len(sub_graphs) > 2:
                 print("子图出现交叉")
-            value.mesh_index = []
+            # for sub in sub_graphs:
+            #     if sub != max_nodes_subgraph:
+            #         verts = mesh.verts_packed().detach().numpy()
+            #         v1 = verts[value.mapping_loop_mesh_index]
+            #         v2 = verts[list(sub.nodes)]
+            #         Draw.plot_two_point(v1, v2)
+
+            value.mapping_inside_mesh_index = []
             for sub in sub_graphs:
                 if sub != max_nodes_subgraph:
-                    value.mesh_index = value.mesh_index + list(sub.nodes)
+                    value.mapping_inside_mesh_index = value.mapping_inside_mesh_index + list(sub.nodes)
 
 
     def update_mesh_vert_to_face(self, mesh):
@@ -1155,8 +1241,6 @@ class OccGeo:
         self.update_edge_shortest_path(mesh)
         # 更新网格点与每一个面的关系
         self.update_mesh_vert_to_geo_face(mesh)
-        # 统计是否正确数据
-        total = 0
         # 更新连续面与网格的关系
         for key, value in self.shell.items():
             continuity_loop = value.out_wire
@@ -1169,7 +1253,7 @@ class OccGeo:
             continuity_faces = value.faces_index
             inside_point = []
             for face_index in continuity_faces:
-                face_mesh_index = self.faces[face_index].mesh_index
+                face_mesh_index = self.faces[face_index].mapping_inside_mesh_index
                 for index in face_mesh_index:
                     if index not in loop_path and index not in inside_point:
                         inside_point += [index]
@@ -1183,26 +1267,31 @@ class OccGeo:
             self.shell[key].inside_mesh_pnt = inside_point.copy()
             self.shell[key].out_wire_mesh_pnt = loop_path.copy()
             # 更新geo中区分内外网格点数组
-            # for i in inside_point:
-            #     if i in self.face_mesh_index:
-            #         print(i, "in重复")
-            #     if i in self.edge_mesh_index:
-            #         print(i, "内在外")
-            # for i in loop_path:
-            #     if i in self.edge_mesh_index:
-            #         print(i, "out重复")
-            #     if i in self.face_mesh_index:
-            #         print(i, "外在内")
-
-
             self.face_mesh_index += inside_point
             self.edge_mesh_index += [index for index in loop_path if index not in self.edge_mesh_index]
-            total += len(inside_point)
-            total += len(loop_path)/2
+            # print(inside_point, loop_path)
+            # vet = mesh.verts_packed().detach().numpy()
+            # v2 = vet[inside_point]
+            # v3 = vet[loop_path]
+            # Draw.plot_two_point(v2, v3)
         self.face_mesh_index.sort()
         self.edge_mesh_index.sort()
+        self.using_map = True
+        total = len(self.face_mesh_index) + len(self.edge_mesh_index)
+        # verts = mesh.verts_packed().detach().numpy()
+        # # v1 = verts[self.face_mesh_index]
+        # v2 = verts[self.edge_mesh_index]
+        # # Draw.plot_two_point(v1, v2)
+        # Draw.plot_point(v2)
         if total != len(mesh.verts_packed()):
-            self.proj_all_face = True
+            # for i in self.face_mesh_index:
+            #     if i in  self.edge_mesh_index:
+            #         print(i, "内外点重合")
+            # counter = Counter(self.face_mesh_index)
+            # duplicates = [item for item, count in counter.items() if count > 1]
+            # if len(duplicates) > 0:
+            #     print(duplicates, "内部点自身重合")
+            self.using_map = False
             print("最短路径出现问题，total=", total, "len(mesh.verts_packed())=", len(mesh.verts_packed()))
 
 
@@ -1215,24 +1304,30 @@ class OccGeo:
         print("根据面积估计工作网格尺寸大小为：", self.mesh_edge_len)
 
     #
-    def mesh_num_in_edge(self):
+    def mesh_num_in_edge(self, vert_num):
         """
         根据面积与长度分配网格点数量,返回网格边长度,每一条线分配的点数量,每个面分配的点数量
+        :param vert_num:    总网格点数量
+        :return:            每一条线分配的点数量
         """
+        curve_sample_num = []
         surfaces_areas = np.array(self.surfaces_area)
-        vertex_per_len = np.sqrt(self.mesh_vert_num / np.sum(surfaces_areas))  # 单位长度点数量
+        vertex_per_len = np.sqrt(vert_num / np.sum(surfaces_areas))  # 单位长度点数量
         for key, value in self.edges.items():
-            curves_length = get_edge_length(value.edge)
-            self.edges[key].sample_num = np.int64(curves_length * vertex_per_len)
+            curves_length = value.curve_length
+            curve_sample_num.append(np.int64(curves_length * vertex_per_len))
+        return curve_sample_num
 
-    def mesh_num_in_face(self):
+    def mesh_num_in_face(self, vert_num):
         """
         计算面采样点数量
         """
+        surface_sample_num = []
         surfaces_areas = np.array(self.surfaces_area)
         for key, value in self.faces.items():
             area = get_sufaces_area(value.face)
-            self.faces[key].sample_num = np.int64((area / np.sum(surfaces_areas)) * self.mesh_vert_num)  # 每个面采样点数量
+            surface_sample_num.append(np.int64((area / np.sum(surfaces_areas)) * vert_num)) # 每个面采样点数量
+        return surface_sample_num
 
     def delete_geo(self, index, dim):
         """
@@ -1349,70 +1444,38 @@ class OccGeo:
         self.delete_geo(delete_pnt_index, 0)
 
     # 根据网格长度对模型中边界进行采样
-    def sample_uniform_in_crv(self, multiple):
+    def sample_uniform_in_crv(self, sample_num):
         """
         geo中所有几何线均匀采样(不包含起点终点)
         :return: 采样点坐标集合 [[[x1,y1,z1], [x2,y2,z2],...], [线2]，...]
         """
         sample_curve = []
-        sample_num = 0
-        # 找到不连续需要采样的边
+        # 采样边key
         sample_edges_index = []
-        sample_curve_num = 0
         for key, value in self.edges.items():
-            # 连续条件与采样点数量不为零
-            if not self.edges[key].is_continuity and self.edges[key].sample_num != 0:
-                sample_edges_index.append(key)
-                sample_curve_num += 1
+            sample_edges_index.append(key)
 
         # 开始采样
-        for key in sample_edges_index:
+        for key, num in zip(sample_edges_index, sample_num):
             value = self.edges[key]
-            curve3D = value.curve
-            first = value.first
-            last = value.last
-            current_sample_num = value.sample_num * multiple  # 采样总数
-            sample_num += current_sample_num
-            sample_interval = 1 / (current_sample_num + 1)  # 单位长度的采样间隔
-            current_curve_interval = sample_interval * (last - first)  # 当前线段上的采样间隔
-            sample_loc = first + np.fromiter(iter(range(1, current_sample_num + 1)),
-                                             dtype=int) * current_curve_interval
-            for j in range(current_sample_num):
-                pnt = curve3D.Value(sample_loc[j])
-                sample_curve_xyz = [pnt.X(), pnt.Y(), pnt.Z()]
-                sample_curve.append(sample_curve_xyz)
-        return sample_num, sample_curve
+            sample = value.SampleEdge(num)
+            if len(sample) > 2:
+                sample_curve += sample[1:-1]
+        return  sample_curve
 
-    def sample_in_surface(self, multiple):
+    def sample_in_surface(self, sample_num):
         """
         geo中所有几何面随机采样
         :param vertex_num_in_each_surface: 采每一个面样点数量[m, m, m,...]
         :return: 采样点坐标集合 [[x1,y1,z1], [x2,y2,z2],...]
         """
         sample_surface = []
-        sample_num = 0
+        sample_faces_index = []
+
         for key, value in self.faces.items():
-            surface = value.surface
-            current_surface_wire = value.wire_discrete_point
-            wire_num = value.wire_num
-            current_surface_sample_num = value.sample_num * multiple
-            sample_num += current_surface_sample_num
-            bound = value.surfaces_bound
-            had_sample_num = 0
-            while had_sample_num < current_surface_sample_num:
-                random_u = np.random.random() * (bound[1] - bound[0]) + bound[0]
-                random_v = np.random.random() * (bound[3] - bound[2]) + bound[2]
-                outwire = current_surface_wire[0]
-                if not pnt_in_polygon(random_u, random_v, outwire):
-                    continue
-                if wire_num > 2:  # 继续检查内环
-                    for m in range(1, wire_num):
-                        current_wire = current_surface_wire[m]
-                        if pnt_in_polygon(random_u, random_v, current_wire):
-                            continue
-                # 检查的uv合法
-                sample_pnt_3d = surface.Value(random_u, random_v)
-                sample_pnt_3d_xyz = [sample_pnt_3d.X(), sample_pnt_3d.Y(), sample_pnt_3d.Z()]
-                sample_surface.append(sample_pnt_3d_xyz)
-                had_sample_num += 1
-        return sample_num, sample_surface
+            sample_faces_index.append(key)
+
+        for key, num in zip(sample_faces_index, sample_num):
+            value = self.faces[key]
+            sample_surface += value.SampleSurface(num)
+        return sample_surface

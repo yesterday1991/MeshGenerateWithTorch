@@ -40,6 +40,7 @@ def plot_point(point):
     x = np_point[:, 0]
     y = np_point[:, 1]
     z = np_point[:, 2]
+    # max = np.max(np_point)
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter3D(x, y, z)
@@ -47,6 +48,9 @@ def plot_point(point):
     ax.set_ylabel('y')
     ax.set_zlabel('z')
     ax.view_init(190, 30)
+    # ax.set_xlim(-max, max)
+    # ax.set_ylim(-max, max)
+    # ax.set_zlim(-max, max)
     plt.show()
 
 
@@ -56,13 +60,41 @@ def plot_two_point(points1, points2):
     y1 = np_point1[:, 1]
     z1 = np_point1[:, 2]
     np_point2 = np.array(points2)
+    max1 = max(np.max(np_point1), np.max(np_point1))
     x2 = np_point2[:, 0]
     y2 = np_point2[:, 1]
     z2 = np_point2[:, 2]
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter3D(x1, y1, z1)
-    ax.scatter3D(x2, y2, z2)
+    ax.scatter3D(x1, y1, z1, color="red")
+    ax.scatter3D(x2, y2, z2, color="blue")
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_zlabel('z')
+    ax.set_xlim(-max1, max1)
+    ax.set_ylim(-max1, max1)
+    ax.set_zlim(-max1, max1)
+    ax.view_init(190, 30)
+    plt.show()
+
+def plot_3_point(points1, points2, points3):
+    np_point1 = np.array(points1)
+    x1 = np_point1[:, 0]
+    y1 = np_point1[:, 1]
+    z1 = np_point1[:, 2]
+    np_point2 = np.array(points2)
+    x2 = np_point2[:, 0]
+    y2 = np_point2[:, 1]
+    z2 = np_point2[:, 2]
+    np_point3 = np.array(points3)
+    x3 = np_point3[:, 0]
+    y3 = np_point3[:, 1]
+    z3 = np_point3[:, 2]
+    fig = plt.figure(figsize=(5, 5))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter3D(x1, y1, z1, color="red")
+    ax.scatter3D(x2, y2, z2, color="blue")
+    ax.scatter3D(x3, y3, z3, color="green")
     ax.set_xlabel('x')
     ax.set_ylabel('y')
     ax.set_zlabel('z')
