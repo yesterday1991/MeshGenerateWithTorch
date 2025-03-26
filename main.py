@@ -43,10 +43,10 @@ else:
 
 mesh_vert_num = len(verts)  # 初始网格顶点数
 # 几何文件名
-# file_name = "K.step"
+file_name = "diamond.step"
 # file_name = "visor.step"
 # file_name = "Part 3.step"
-file_name = "new_part15.step"
+# file_name = "new_part1.step"
 # file_name = "dirty_cube.step"
 # file_name = "Part_1_154.step"
 # 设置网格尺寸
@@ -108,7 +108,7 @@ deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, req
 optimizer = torch.optim.Adam([deform_verts], lr=0.01) #SGD([deform_verts], lr=1, momentum=0.9)##
 
 # Number of optimization steps
-Niter = 10000
+Niter = 400
 
 # Weight for the chamfer loss
 w_chamfer = 1
@@ -156,8 +156,8 @@ for i in range(Niter):
     #
     if wrapping:
         loss_chamfer = Loss.geo_chamfer_loss(new_src_mesh, geo)
-        total_loss = (  loss_edge_length * w_edge_length + w_chamfer * loss_chamfer +loss_angle * w_angle +#
-                        loss_normal * w_normal  + loss_laplacian * w_laplacian) #
+        total_loss = ( loss_edge_length * w_edge_length + w_chamfer * loss_chamfer + loss_angle * w_angle +#  +
+                       loss_normal * w_normal  + loss_laplacian * w_laplacian) #
 
         chamfer_losses.append(float(loss_chamfer.detach().cpu()))
         print("wrapping, ",i, loss_chamfer, loss_angle, loss_edge_length, loss_normal, loss_laplacian)

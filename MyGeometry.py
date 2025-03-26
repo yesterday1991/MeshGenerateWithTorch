@@ -26,6 +26,7 @@ import scipy.sparse.linalg as spla
 import Draw
 import igl
 from collections import Counter
+from collections import defaultdict
 
 geo_eps = 1e-4
 # 判断面之间是否连续的角度
@@ -912,6 +913,9 @@ class OccGeo:
         self.plot_sample = self.sample_geo(vert_num)
         print("几何采样完成")
 
+        # 可能需要进行网格边交换的网格点
+        self.mesh_duplicates = {}
+
 
     def sample_geo(self, sample_num):
         """
@@ -1150,20 +1154,20 @@ class OccGeo:
         :param mesh: 网格
         """
         # 按照先处理
-        continuity_edge = []
-        discontinuous = []
-        for key, value in self.edges.items():
-            if self.edges[key].is_continuity:
-                continuity_edge.append(key)
-            else:
-                discontinuous.append(key)
-        order = continuity_edge + discontinuous
-        # 去除已匹配的点
-        had_match_pnt = []
+        # continuity_edge = []
+        # discontinuous = []
+        # for key, value in self.edges.items():
+        #     if self.edges[key].is_continuity:
+        #         continuity_edge.append(key)
+        #     else:
+        #         discontinuous.append(key)
+        # order = continuity_edge + discontinuous
+        # 找打可能存在问题的点
+        all_short_path = []
         edges_packed = mesh.edges_packed().tolist()
         edge_num = len(edges_packed)
-        # for key, value in self.edges.items():
-        for key in order:
+        for key, value in self.edges.items():
+        # for key in order:
             value = self.edges[key]
             # 权重为所有网格点到该边的距离
             weight = value.MeshVertToEdge
@@ -1188,7 +1192,14 @@ class OccGeo:
             self.edges[key].shortest_path = shortest_path
             sample_curve_xyz = value.SampleEdge(len(shortest_path))
             value.shortest_path_sample = sample_curve_xyz
-            had_match_pnt += shortest_path[1:-1]
+            all_short_path.append(shortest_path[1:-1])
+        # 找到short中的重复元素
+        num_to_rows = defaultdict(set)  # 用集合存储行号，避免重复
+        for row_idx, row in enumerate(all_short_path):
+            for num in row:
+                num_to_rows[num].add(row_idx)  # 记录数值在哪些行出
+        self.mesh_duplicates = {num: sorted(rows) for num, rows in num_to_rows.items() if len(rows) > 1}
+
 
     def update_mesh_vert_to_geo_face(self, mesh):
         """
