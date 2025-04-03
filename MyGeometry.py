@@ -23,6 +23,8 @@ import numpy as np
 import math
 import networkx as nx
 import scipy.sparse.linalg as spla
+from torch.fx.experimental.unification.unification_tools import first
+
 import Draw
 import igl
 from collections import Counter
@@ -487,6 +489,7 @@ def project_mesh_to_geo(mesh, geo):
     proj_point_xyz = []
     for key, value in geo.faces.items():
         value.proj_mesh_index = []
+    geo.mesh_belong_face = {}
     # 统计距离
     geo.mesh_dist_to_geo = 0
     # 开始投影
@@ -524,6 +527,7 @@ def project_mesh_to_geo(mesh, geo):
                 current_proj_xyz = [X, Y, Z]
             proj_point_xyz.append(current_proj_xyz)  # 记录全局最近坐标
             geo.faces[belong_face].proj_mesh_index.append(index)
+            geo.mesh_belong_face[index] = belong_face
             geo.mesh_dist_to_geo += projection_min_dist
         else:
             # 计算点到其限定的loop内部的投影
@@ -751,6 +755,29 @@ class MyEdge:
             sample.append(sample_curve_xyz)
         return sample
 
+    def closest_point_on_curve_from_mesh_edge(self, p1, p2, n_samples=10):
+        """
+        计算网格边 (p1, p2) 整条线段到曲线的最近点
+        :param p1: 端点1 [x, y, z]
+        :param p2: 端点2 [x, y, z]
+        :param n_samples: 线段的离散采样点数
+        :return: 最近点 [x, y, z]
+        """
+        t_values = np.linspace(0, 1, n_samples)
+        p1_pnt = gp_Pnt(p1[0], p1[1], p1[2])
+        p2_pnt = gp_Pnt(p2[0], p2[1], p2[2])
+        min_dist = float('inf')
+        for t in t_values:
+            x = (1 - t) * p1_pnt.X() + t * p2_pnt.X()
+            y = (1 - t) * p1_pnt.Y() + t * p2_pnt.Y()
+            z = (1 - t) * p1_pnt.Z() + t * p2_pnt.Z()
+            test_pnt = gp_Pnt(x, y, z)
+            dist, proj_point, _ = project_to_curve(test_pnt, self)
+            if dist < min_dist:
+                min_dist = dist
+                closest_curve_projection = proj_point
+
+        return  [closest_curve_projection.X(), closest_curve_projection.Y(), closest_curve_projection.Z()]
 
 class MyFace:
     """
@@ -780,6 +807,7 @@ class MyFace:
         self.contain_edge_index = []
         self.out_wire_index = []
         exp_map_edge = TopExp_Explorer(face, TopAbs_EDGE)
+
         while exp_map_edge.More():
             tmp_edge = topods.Edge(exp_map_edge.Current())
             if map_edge.IsBound(tmp_edge):
@@ -868,10 +896,12 @@ class OccGeo:
         self.int_map_vert = TopTools_DataMapOfShapeInteger()  # 点编号
         self.vertexs = {}  # 顶点
         self.num_vertex = 0  # 点数量
+        self.vert_to_edge = {}  # 几何点与几何边的关系
 
         self.int_map_edge = TopTools_DataMapOfShapeInteger()  # 边编号
         self.edges = {}  # 拓扑边
         self.num_edge = 0  # 边数量
+        self.edge_to_surface ={} # 几何边与几何面的关系
 
         self.faces = {}  # 拓扑面
         self.num_face = 0  # 面数量
@@ -915,6 +945,9 @@ class OccGeo:
 
         # 可能需要进行网格边交换的网格点
         self.mesh_duplicates = {}
+
+        # 网格点所属面
+        self.mesh_belong_face = {}
 
 
     def sample_geo(self, sample_num):
@@ -1045,6 +1078,8 @@ class OccGeo:
                 map_edge2face[j].append(i)  # 得到边与面的关系
         for i in range(self.num_edge):
             self.edges[i].belong_face_index = np.array(map_edge2face[i])
+            self.edge_to_surface[i] = map_edge2face[i]
+
 
         print("边数量",self.num_edge, "  面数量", self.num_face)
 
@@ -1368,6 +1403,7 @@ class OccGeo:
             for i in delete_edge.belong_face_index:
                 self.faces[i].contain_edge_index = [x for x in self.faces[i].contain_edge_index if x != index]
                 self.faces[i].out_wire_index = [x for x in self.faces[i].out_wire_index if x != index]
+            self.edge_to_surface.pop(index)
             self.edges.pop(index)
             self.num_edge -= 1
         if dim == 2:

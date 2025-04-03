@@ -43,12 +43,12 @@ else:
 
 mesh_vert_num = len(verts)  # 初始网格顶点数
 # 几何文件名
-file_name = "diamond.step"
+# file_name = "diamond.step"
 # file_name = "visor.step"
 # file_name = "Part 3.step"
 # file_name = "new_part1.step"
 # file_name = "dirty_cube.step"
-# file_name = "Part_1_154.step"
+file_name = "new_part1_new.step"
 # 设置网格尺寸
 
 
@@ -108,7 +108,7 @@ deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, req
 optimizer = torch.optim.Adam([deform_verts], lr=0.01) #SGD([deform_verts], lr=1, momentum=0.9)##
 
 # Number of optimization steps
-Niter = 400
+Niter = 800
 
 # Weight for the chamfer loss
 w_chamfer = 1
