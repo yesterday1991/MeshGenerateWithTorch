@@ -7,6 +7,9 @@ import Myio
 import MyGeometry
 from collections import defaultdict, deque, Counter
 
+
+stitch_mesh = True
+
 def find_neighbors(target, indx):
     """
     找到目标列表中，与indx相邻的元素
@@ -82,6 +85,27 @@ def mesh_edge_swap(faces, fist, last, index, common_elements):
     faces = torch.cat((faces, torch.tensor([[fist, last, common_elements], [fist, index, last]])), dim=0)
     return faces
 
+def add_mesh_face_with_4_pnts(mesh_faces, mesh_verts,f1, f2, e1, e2):
+    """
+    将四个点构成的面片添加到网格面中
+    :param mesh_faces:   网格面
+    :param mesh_verts:   网格顶点
+    :param f1:         e1------e2
+    :param f2:        /       /
+    :param e1:       /       /
+    :param e2:      f1------f2
+    :return:
+    """
+    dist1 = torch.norm(mesh_verts[f1] - mesh_verts[e2])
+    dist2 = torch.norm(mesh_verts[f2] - mesh_verts[e1])
+    if dist1 > dist2:
+        mesh_faces = torch.cat((mesh_faces, torch.tensor([[f1, f2, e1]])), dim=0)
+        mesh_faces = torch.cat((mesh_faces, torch.tensor([[e1, e2, f2]])), dim=0)
+    else:
+        mesh_faces = torch.cat((mesh_faces, torch.tensor([[f1, e1, e2]])), dim=0)
+        mesh_faces = torch.cat((mesh_faces, torch.tensor([[f1, f2, e2]])), dim=0)
+    return mesh_faces
+
 
 def is_triangle_in_faces(faces, i, j, k):
     """
@@ -103,8 +127,7 @@ def compute_face_adjacency(faces):
     :return:        邻接表 {face_id: [adjacent_face_ids]}
     """
     adjacency = defaultdict(set)
-    edge_to_faces = defaultdict(list)  # 每条边对应的面
-
+    edges_to_faces = defaultdict(set)  # 每条边对应的面
     # 遍历所有三角形，记录边到面片的映射
     for i, face in enumerate(faces):
         # 对每一条边进行排序，确保无向边是唯一的
@@ -115,10 +138,10 @@ def compute_face_adjacency(faces):
         ]
         # 记录每条边和其对应的面片索引
         for edge in edges:
-            edge_to_faces[edge].append(i)
+            edges_to_faces[edge].add(i)
 
     # 通过共享边更新邻接关系
-    for edge, face_list in edge_to_faces.items():
+    for edge, face_list in edges_to_faces.items():
         if len(face_list) == 2:  # 如果某条边只被两个面共享，更新它们的邻接关系
             face_1, face_2 = face_list
             adjacency[face_1].add(face_2)
@@ -250,12 +273,32 @@ def find_common_edges(sorted_faces, face_vertices):
 
     return common_edges
 
+def find_cross_curve_mesh_face(curve_mesh_face, all_mesh_face, geo_faces):
+    """
+    从curve_mesh_face中找到横跨几何线的网格面
+    :param curve_mesh_face:         待选择的网格面id
+    :param all_mesh_face:           网格的所有网格面数组
+    :param geo_faces:               当前线所横跨的两个几何面
+    :return:
+    """
+    find_face = -1
+    for mesh_face in curve_mesh_face:
+        a, b, c = all_mesh_face[mesh_face]
+        geo_faces_list = []
+        for p in (a, b, c):
+            geo_faces_list.append(geo.mesh_belong_face[p.item()])
+        if set(geo_faces).issubset(set(geo_faces_list)):
+            find_face = mesh_face
+    return find_face
+
+
 
 verts, faces = Myio.read_obj("final_model_test.obj")
 verts = torch.tensor(verts, dtype=torch.float32)
 faces = torch.tensor(faces, dtype=torch.int64)
 
-file_name = "new_part1_new.step"
+file_name = "diamond.step"
+# file_name = "visor.step"
 # file_name = "new_part15.step"
 mesh_vert_num =verts.shape[0]
 geo = MyGeometry.OccGeo(file_name, mesh_vert_num)
@@ -359,86 +402,111 @@ new_mesh_pnt = new_src_mesh.verts_packed()
 new_mesh_face = new_src_mesh.faces_packed()
 # geo.update_mesh_vert_to_face(new_src_mesh)
 
-adjacency = compute_face_adjacency(new_mesh_face)
 
-edge_to_faces = defaultdict(set)
-vert_to_faces = defaultdict(set)
-# 遍历网格面，找出跨多个几何面的网格面索引
-for i, face in enumerate(new_mesh_face):
-        p1, p2, p3 = face  # 获取该面上的三个点
-        # 逐个检查每个点的几何面归属
-        mesh_face_list = []
-        # 逐步添加该点所属的几何面
-        for p in (p1, p2, p3):
-            mesh_face_list.append(geo.mesh_belong_face[p.item()])
-        mesh_face_set = set(mesh_face_list)
-        # 如果该网格面跨多个几何面，则记录其索引
-        if len(mesh_face_set) == 2:
-            face_pair = tuple(sorted(mesh_face_set))
-            # 利用网格面横跨的几何面与 几何边相接的几何面进行对比，确定网格面所属几何面
-            for edge, surfaces in geo.edge_to_surface.items():
-                if set(face_pair) == set(surfaces):
-                    edge_to_faces[edge].add(i)
-        elif len(mesh_face_set) == 3:
-            # 如果该网格面跨三个几何面，为顶点位置
-            edges_end = []
-            # 将三个面中所有顶点全集中起来， 次数最多的顶点为该跨三个几何面的网格对应的顶点
-            for face_key in mesh_face_list:
-                edges_key = geo.faces[face_key].contain_edge_index
-                for edge_key in edges_key:
-                    edges_end = edges_end + geo.edges[edge_key].end_pnt_index
+if stitch_mesh:
+    # 新建动态网格数组
+    My_mesh = DynamicMesh(new_mesh_pnt.tolist(), new_mesh_face.tolist())
+    # 计算邻接关系
+    adjacency= compute_face_adjacency(new_mesh_face)
 
-            # 找几何边的公共顶点
-            count = Counter(edges_end)
-            most_common_num, _ = count.most_common(1)[0]
-            vert_to_faces[most_common_num].add(i)
+    # 顶点处的网格点
+    geo_vert_to_mesh_pnt = defaultdict(set)
+    new_mesh_pnt_num = len(new_mesh_pnt)
+    # 遍历所有几何边，找到不连续的边，增加顶点
+    for key, value in geo.edges.items():
+        # 不连续需要对该边进行缝合，先增加端点处增加对应的网格点：
+        if not value.is_continuity:
+            # 添加端点
+            for end in value.end_pnt_index:
+                # 保证不重复添加
+                if end not in geo_vert_to_mesh_pnt:
+                    new_pnt_xyz = geo.vertexs[end].GetPntXYZ()
+                    new_mesh_pnt = torch.cat([new_mesh_pnt, torch.tensor(new_pnt_xyz).unsqueeze(0)], dim=0)
+                    geo_vert_to_mesh_pnt[end] = new_mesh_pnt_num
+                    new_mesh_pnt_num += 1
 
-# 增加顶点
-new_mesh_pnt_num = len(new_mesh_pnt)
-vertexs_to_pnt = {}
-for key, value in vert_to_faces.items():
-    # 检查这个顶点所连接的边是否都是连续的，如果不是则新建一个网格顶点
-    vert_is_continuity = True
-    for edge in geo.vertexs[key].belong_curve_index:
-        if not geo.edges[edge].is_continuity:
-            vert_is_continuity = False
-    if not vert_is_continuity:
-        new_pnt_xyz = geo.vertexs[key].GetPntXYZ()
-        new_mesh_pnt = torch.cat([new_mesh_pnt, torch.tensor(new_pnt_xyz).unsqueeze(0)], dim=0)
-        vertexs_to_pnt[key] = new_mesh_pnt_num
-        new_mesh_pnt_num += 1
+    # 跨几何边的网格面
+    geo_edge_to_mesh_faces = defaultdict(set)
+    # 顶点处的网格面
+    geo_vert_to_mesh_faces = defaultdict(set)
+    # 遍历网格面，找出跨多个几何面的网格面索引
+    for i, current_mesh_face in enumerate(new_mesh_face):
+            p1, p2, p3 = current_mesh_face  # 获取该面上的三个点
+            # 逐个检查每个点的几何面归属
+            mesh_face_list = []
+            # 逐步添加该点所属的几何面
+            for p in (p1, p2, p3):
+                mesh_face_list.append(geo.mesh_belong_face[p.item()])
+            # 字典去重
+            mesh_face_set = set(mesh_face_list)
+            # 如果该网格面跨多个几何面，则记录其索引
+            if len(mesh_face_set) == 2:
+                face_pair = tuple(sorted(mesh_face_set))
+                # 利用网格面横跨的几何面与 几何边相接的几何面进行对比，确定网格面所属几何面
+                for edge, surfaces in geo.edge_to_surface.items():
+                    if set(face_pair) == set(surfaces):
+                        geo_edge_to_mesh_faces[edge].add(i)
+            elif len(mesh_face_set) == 3:
+                # 如果该网格面跨三个几何面，为顶点位置
+                edges_end = []
+                # 将三个面中所有顶点全集中起来， 次数最多的顶点为该跨三个几何面的网格对应的顶点
+                for face_key in mesh_face_list:
+                    edges_key = geo.faces[face_key].contain_edge_index
+                    for edge_key in edges_key:
+                        edges_end = edges_end + geo.edges[edge_key].end_pnt_index
 
-# 根据边增加网格
-for key, value in geo.edges.items():
-    geo_face = geo.edge_to_surface[key]
-    if len(geo_face) != 2:
-        print(key, "为非流形边，不处理")
-        continue
-    ends = value.end_pnt_index
-    if ends[0] not in vertexs_to_pnt and ends[1] not in vertexs_to_pnt:
-        continue
-    # 按照邻接顺序给网格面进行排序
-    first_mesh_face = list(vert_to_faces[ends[0]])
-    path = list(edge_to_faces[key])
-    last_mesh_face = list(vert_to_faces[ends[1]])
-    all_faces = first_mesh_face + path + last_mesh_face
-    sorted_faces = sort_faces_by_adjacency(all_faces, adjacency)
-    common_edge = find_common_edges(sorted_faces, new_mesh_face)
-    # 得到分布在两个面中的网格点
-    edge_related_mesh = []
-    for face_indx in geo_face:
-        current_pnt = []
-        for current_mesh_face in sorted_faces:
-            tmp = find_tri_in_face(geo, new_mesh_face, face_indx, current_mesh_face)
-            for i in tmp:
-                if i not in current_pnt:
-                    current_pnt.append(i)
-        edge_related_mesh.append(current_pnt)
+                # 找几何边的公共顶点
+                count = Counter(edges_end)
+                most_common_num, _ = count.most_common(1)[0]
+                geo_vert_to_mesh_faces[most_common_num].add(i)
 
-    if not value.is_continuity:
-        # 在边上新建网格点
+    if len(geo_vert_to_mesh_faces) != len(geo_vert_to_mesh_pnt):
+        print("顶点处网格点与顶点处网格面数量不匹配")
+
+    # 在不连续的边处增加网格顶点，并进行缝合
+    for key, value in geo.edges.items():
+        # 验证是否连续
+        if value.is_continuity:
+            continue
+        # 验证该边的属性
+        geo_faces = geo.edge_to_surface[key]
+        if len(geo_faces) < 2:
+            print(key, "为边界边或者孤边，不处理")
+            continue
+        if len(geo_faces) > 2:
+            print(key, "非流形边，暂不处理")
+            continue
+        # 边的端点
+        curve_ends = value.end_pnt_index
+        # 找到该边处所有跨面的网格
+        curve_first_mesh_face = list(geo_vert_to_mesh_faces[curve_ends[0]])
+        # 顶点处可能存在多个备选的网格面,选择横跨这条边的面
+        if len(curve_first_mesh_face) != 1:
+            curve_first_mesh_face = [find_cross_curve_mesh_face(curve_first_mesh_face, new_mesh_face, geo_faces)]
+        curve_path = list(geo_edge_to_mesh_faces[key])
+        curve_last_mesh_face = list(geo_vert_to_mesh_faces[curve_ends[1]])
+        if len(curve_last_mesh_face) != 1:
+            curve_last_mesh_face = [find_cross_curve_mesh_face(curve_last_mesh_face, new_mesh_face, geo_faces)]
+        # 将所有网格面进行排序
+        curve_all_mesh_faces = curve_first_mesh_face + curve_path + curve_last_mesh_face
+        sorted_faces = sort_faces_by_adjacency(curve_all_mesh_faces, adjacency)
+        # 根据排序后的三角形找到公共边
+        common_edge = find_common_edges(sorted_faces, new_mesh_face)
+
+        # 得到分布在两个面中的网格点
+        edge_related_mesh_in_each_face = []
+        for face_indx in geo_faces:
+            current_pnt = []
+            for current_mesh_face in sorted_faces:
+                tmp = find_tri_in_face(geo, new_mesh_face, face_indx, current_mesh_face)
+                for i in tmp:
+                    if i not in current_pnt:
+                        current_pnt.append(i)
+            edge_related_mesh_in_each_face.append(current_pnt)
+
+        # 在公共边上增加网格点
         current_edge_new_pnt = []
-        current_edge_new_pnt = current_edge_new_pnt + [vertexs_to_pnt[ends[0]]]
+        current_edge_new_pnt = current_edge_new_pnt + [geo_vert_to_mesh_pnt[curve_ends[0]]]
         for common in common_edge[1::2]:
             p1 = new_mesh_pnt[common[0]].tolist()
             p2 = new_mesh_pnt[common[1]].tolist()
@@ -446,64 +514,70 @@ for key, value in geo.edges.items():
             new_mesh_pnt = torch.cat([new_mesh_pnt, torch.tensor(new_pnt_xyz).unsqueeze(0)], dim=0)
             current_edge_new_pnt.append(new_mesh_pnt_num)
             new_mesh_pnt_num += 1
-        current_edge_new_pnt = current_edge_new_pnt + [vertexs_to_pnt[ends[1]]]
-
+        current_edge_new_pnt = current_edge_new_pnt + [geo_vert_to_mesh_pnt[curve_ends[1]]]
         # 将两个面中的点进行缝合
         for i in range(2):
-            current_related_mesh = edge_related_mesh[i]
-            # 第一个三角面面片
-            new_mesh_face = torch.cat((new_mesh_face, torch.tensor(
-                [[current_related_mesh[0], current_edge_new_pnt[0], current_edge_new_pnt[1]]])),
-                                  dim=0)
-            # 中间的按四个点处理，找出短边作为网格边
-            for j in range(len(current_related_mesh) - 1):
-                face_pnt1 = current_related_mesh[j]
-                face_pnt2 = current_related_mesh[j + 1]
-                edge_pnt1 = current_edge_new_pnt[j + 1]
-                edge_pnt2 = current_edge_new_pnt[j + 2]
-                d1 = torch.norm(new_mesh_pnt[face_pnt1] - new_mesh_pnt[edge_pnt2])
-                d2 = torch.norm(new_mesh_pnt[face_pnt2] - new_mesh_pnt[edge_pnt1])
-                if d1 > d2:
-                    new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[face_pnt1, face_pnt2, edge_pnt1]])), dim=0)
-                    new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[edge_pnt1, edge_pnt2, face_pnt2]])), dim=0)
-                else:
-                    new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[face_pnt1, edge_pnt1, edge_pnt2]])), dim=0)
-                    new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[face_pnt1, face_pnt2, edge_pnt2]])), dim=0)
-            # 面上的点比边上的点少2个，最后还有一个三角片需要构造
-            if len(current_edge_new_pnt) - len(current_related_mesh) == 2:
+            current_face_related_mesh = edge_related_mesh_in_each_face[i]
+            # 情况1   面上的点与边上的点一样
+            if len(current_face_related_mesh) == len(current_face_related_mesh):
+                for j in range(len(current_face_related_mesh) - 1):
+                    face_pnt1 = current_face_related_mesh[j]
+                    face_pnt2 = current_face_related_mesh[j + 1]
+                    edge_pnt1 = current_edge_new_pnt[j]
+                    edge_pnt2 = current_edge_new_pnt[j + 1]
+                    # 增加网格面
+                    new_mesh_face = add_mesh_face_with_4_pnts(new_mesh_face, new_mesh_pnt, face_pnt1, face_pnt2, edge_pnt1, edge_pnt2)
+            # 情况2  面上的点比边上的少1，或者2
+            elif len(current_face_related_mesh) < len(current_edge_new_pnt):
+                # 第一个三角面面片
                 new_mesh_face = torch.cat((new_mesh_face, torch.tensor(
-                    [[current_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2]]])),
-                                          dim=0)
-    else:
-        # 如果边是连续的，则需要检查该边顶点所连接的其余边是否是连续的，
-        # 如果存在不连续的边，则需要进行处理
-        for end in ends:
-            print(geo_face)
-            if end in vertexs_to_pnt:
-                new_tris = [vertexs_to_pnt[end]]
-                current_face = new_mesh_face[list(vert_to_faces[end])[0]]
-                for k in current_face:
-                    print(geo.mesh_belong_face[k.item()])
-                    if geo.mesh_belong_face[k.item()] in geo_face:
-                        new_tris.append(k.item())
-                new_mesh_face = torch.cat((new_mesh_face, torch.tensor([new_tris])), dim=0)
+                    [[current_face_related_mesh[0], current_edge_new_pnt[0], current_edge_new_pnt[1]]])),
+                                      dim=0)
+                # 中间的按四个点处理，找出短边作为网格边
+                for j in range(len(current_face_related_mesh) - 1):
+                    face_pnt1 = current_face_related_mesh[j]
+                    face_pnt2 = current_face_related_mesh[j + 1]
+                    edge_pnt1 = current_edge_new_pnt[j + 1]
+                    edge_pnt2 = current_edge_new_pnt[j + 2]
+                    # 增加网格面
+                    new_mesh_face = add_mesh_face_with_4_pnts(new_mesh_face, new_mesh_pnt, face_pnt1, face_pnt2, edge_pnt1, edge_pnt2)
+
+                # 面上的点比边上的点少2个，最后还有一个三角片需要构造
+                if len(current_edge_new_pnt) - len(current_face_related_mesh) == 2:
+                    new_mesh_face = torch.cat((new_mesh_face, torch.tensor(
+                        [[current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2]]])),
+                                              dim=0)
+    # 删除
+    # 处理连续的边，其在顶点位置连接其他不连续边，存在的网格缺失情况
+    # for key, value in geo.edges.items():
+    #     # 验证是否连续
+    #     if not value.is_continuity:
+    #         continue
+    #     # 边的端点
+    #     curve_ends = value.end_pnt_index
+    #     # 相关面
+    #     geo_faces = geo.edge_to_surface[key]
+    #     # 处理端点
+    #     for end in curve_ends:
+    #         # 验证该边端点是否对应了网格顶点
+    #         if end in geo_vert_to_mesh_pnt:
+    #             # 第一个点为网格点
+    #             new_tris = [geo_vert_to_mesh_pnt[end]]
+    #             # 找到该点处所有跨面的网格
+    #             current_mesh_faces = list(geo_vert_to_mesh_faces[end])
+    #             for face_indx in geo_faces:
+    #                 for mesh_face_indx in current_mesh_faces:
+    #                     tmp = find_tri_in_face(geo, new_mesh_face, face_indx, mesh_face_indx)
+    #                     if len(tmp) != 1:
+    #                         print("连续处顶点找到的顶点不唯一，需要检查问题")
+    #                     if len(tmp) != 0 and tmp[0]not in new_tris:
+    #                         new_tris += tmp
+    #             if len(new_tris) == 3:
+    #                 new_mesh_face = torch.cat((new_mesh_face, torch.tensor([new_tris])), dim=0)
+    #             else:
+    #                 print("连续处顶点位置出现错误，需要检查问题")
 
 
-
-        #
-        # if ends[0] in vertexs_to_pnt:
-        #     k= new_mesh_face[vert_to_faces[ends[0]]]
-        #     edge_pnt1 = vertexs_to_pnt[ends[0]]
-        #     face_pnt1 = edge_related_mesh[0][0]
-        #     face_pnt2 = edge_related_mesh[1][0]
-        #     new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[face_pnt1, face_pnt2, edge_pnt1]])), dim=0)
-        # if ends[1] in vertexs_to_pnt:
-        #     k = new_mesh_face[list(vert_to_faces[ends[1]])[0]]
-        #
-        #     edge_pnt1 = vertexs_to_pnt[ends[1]]
-        #     face_pnt1 = edge_related_mesh[0][-1]
-        #     face_pnt2 = edge_related_mesh[1][-1]
-        #     new_mesh_face = torch.cat((new_mesh_face, torch.tensor([[face_pnt1, face_pnt2, edge_pnt1]])), dim=0)
 
 
 # # 边界点用路径点

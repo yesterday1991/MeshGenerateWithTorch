@@ -23,7 +23,7 @@ import numpy as np
 import math
 import networkx as nx
 import scipy.sparse.linalg as spla
-from torch.fx.experimental.unification.unification_tools import first
+
 
 import Draw
 import igl
@@ -32,7 +32,7 @@ from collections import defaultdict
 
 geo_eps = 1e-4
 # 判断面之间是否连续的角度
-continuity_face_angel = 0.5
+continuity_face_angel = 0.1
 # 判定小边条件，为与工作网格尺寸的比例
 small_edge_ratio = 0.5
 
@@ -1078,7 +1078,7 @@ class OccGeo:
                 map_edge2face[j].append(i)  # 得到边与面的关系
         for i in range(self.num_edge):
             self.edges[i].belong_face_index = np.array(map_edge2face[i])
-            self.edge_to_surface[i] = map_edge2face[i]
+            self.edge_to_surface[i] = tuple(sorted(set(map_edge2face[i])))
 
 
         print("边数量",self.num_edge, "  面数量", self.num_face)
