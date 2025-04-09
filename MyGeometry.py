@@ -755,18 +755,19 @@ class MyEdge:
             sample.append(sample_curve_xyz)
         return sample
 
-    def closest_point_on_curve_from_mesh_edge(self, p1, p2, n_samples=10):
+    def closest_point_on_curve_from_mesh_edge(self, p1, p2, n_samples=11):
         """
         计算网格边 (p1, p2) 整条线段到曲线的最近点
         :param p1: 端点1 [x, y, z]
         :param p2: 端点2 [x, y, z]
         :param n_samples: 线段的离散采样点数
-        :return: 最近点 [x, y, z]
+        :return: 最近点 [x, y, z] , 投影点在网格边位置
         """
         t_values = np.linspace(0, 1, n_samples)
         p1_pnt = gp_Pnt(p1[0], p1[1], p1[2])
         p2_pnt = gp_Pnt(p2[0], p2[1], p2[2])
         min_dist = float('inf')
+        min_t = float('inf')
         for t in t_values:
             x = (1 - t) * p1_pnt.X() + t * p2_pnt.X()
             y = (1 - t) * p1_pnt.Y() + t * p2_pnt.Y()
@@ -776,8 +777,9 @@ class MyEdge:
             if dist < min_dist:
                 min_dist = dist
                 closest_curve_projection = proj_point
+                min_t = t
 
-        return  [closest_curve_projection.X(), closest_curve_projection.Y(), closest_curve_projection.Z()]
+        return  [closest_curve_projection.X(), closest_curve_projection.Y(), closest_curve_projection.Z()], min_t
 
 class MyFace:
     """
