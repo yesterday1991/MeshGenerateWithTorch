@@ -16,6 +16,7 @@ stitch_mesh = True
 # BUG:2. 缝合过程补充边界与以后网格贴很近   2025.4.7 √
 # BUG:3. 跨面网格跨非连续的面，网格缝合与网格删除均存在问题 2025.4.8 √
 # BUG:4. 顶点处连接多条边（大于4）可能出现缝合不准确 2025.4.8 √
+# 新增3. 脏几何之不连续边界处理    2025.4.10 √
 
 
 def find_neighbors(target, indx):
@@ -448,7 +449,7 @@ MyGeometry.create_mesh_graph(new_src_mesh, geo)
 
 tris = verts[faces]
 
-Draw.plot_two_point(geo.plot_sample, new_src_mesh.verts_packed().numpy())
+# Draw.plot_two_point(geo.plot_sample, new_src_mesh.verts_packed().numpy())
 # abc 中需要缩放，但计算时候忘记处理了，这里进行缩放
 # tmp_scale = 0.001
 # tmp_scale = geo.scale / tmp_scale
@@ -536,18 +537,29 @@ new_mesh_face = new_src_mesh.faces_packed()
 # geo.update_mesh_vert_to_face(new_src_mesh)
 
 
-
-
+# 记录网格中固定的边界
+fixed_boundary_mesh_pnt = set()
+# 缝合几何特征
 if stitch_mesh:
     # 新建动态网格数组
     My_mesh = DynamicMesh(new_mesh_pnt.tolist(), new_mesh_face.tolist())
     # 计算邻接关系
     adjacency= compute_face_adjacency(new_mesh_face)
-
+    # 只关联一个面的边为边界边
+    boundary_geo_curve = set()
+    # 边界边的顶点
+    boundary_geo_pnt = set()
+    # 边界边所在的几何面
+    geo_face_with_boundary_geo_curve = set()
     # 顶点处的网格点
     geo_vert_to_mesh_pnt = defaultdict(set)
     # 遍历所有几何边，找到不连续的边，增加顶点
     for key, value in geo.edges.items():
+        # 边界边不认为是几何特征
+        if len(geo.edge_to_surface[key]) < 2:
+            boundary_geo_curve.add(key)
+            geo_face_with_boundary_geo_curve.update(value.belong_face_index)
+            continue
         # 不连续需要对该边进行缝合，先增加端点处增加对应的网格点：
         if not value.is_continuity:
             # 添加端点
@@ -557,12 +569,18 @@ if stitch_mesh:
                     new_pnt_xyz = geo.vertexs[end].GetPntXYZ()
                     new_mesh_pnt_id = My_mesh.add_vertex(new_pnt_xyz)
                     geo_vert_to_mesh_pnt[end] = new_mesh_pnt_id
+    # 找到边界边的顶点
+    for i in boundary_geo_curve:
+        boundary_geo_pnt.update(geo.edges[i].end_pnt_index)
 
     # 跨几何边的网格面
     geo_edge_to_mesh_faces = defaultdict(set)
     # 顶点处的网格面
     geo_vert_to_mesh_faces = defaultdict(set)
+    # 横跨了不邻接几何面的网格面
     mesh_face_cross_unconnected_geo_face = []
+    # 受到边界点牵连的不处理的几何线
+    geo_edge_involve_boundary_pnt = set()
     # 遍历网格面，找出跨多个几何面的网格面索引
     for i, current_mesh_face in enumerate(new_mesh_face):
             p1, p2, p3 = current_mesh_face  # 获取该面上的三个点
@@ -585,7 +603,9 @@ if stitch_mesh:
                         found_edge = True
                 # 如果该网格面没有找到对应的几何边，则说明该网格面的几何面不连续
                 if not found_edge:
-                    mesh_face_cross_unconnected_geo_face.append(i)
+                    # 检查不连续的面是否为边界面
+                    if not set(face_pair).issubset(geo_face_with_boundary_geo_curve):
+                        mesh_face_cross_unconnected_geo_face.append(i)
             elif len(mesh_face_set) == 3:
                 # 如果该网格面跨三个几何面，为顶点位置
                 edges_end = []
@@ -642,13 +662,16 @@ if stitch_mesh:
                 if len(other_sublist) == 0:
                     changed = False
         if len(other_sublist) != 0:
-            print("仍然跨三个几何面的网格顶点为组成联通区域")
+            print("仍然跨三个几何面的网格顶点为组成联通区域", other_sublist)
+            print(extended)
+            print(key)
         geo_vert_to_mesh_faces[key] = extended
     if len(alternative) != 0:
             print("仍然存在跨不连续几何面的网格面未被处理")
     # 删除几何顶点处对应的网格面
-    for _, value in geo_vert_to_mesh_faces.items():
-        My_mesh.delete_list_face(value)
+    for key, value in geo_vert_to_mesh_faces.items():
+        if key not in boundary_geo_pnt:
+            My_mesh.delete_list_face(value)
 
     # 统计几何顶点处的网格顶点在不同几何面中所连接的网格点
     geo_vert_to_mesh_pnt_in_geo_face = defaultdict(lambda: defaultdict(set))
@@ -656,6 +679,12 @@ if stitch_mesh:
     for key, value in geo.edges.items():
         # 验证是否连续
         if value.is_continuity:
+            continue
+        # 边的端点
+        curve_ends = value.end_pnt_index
+        # 如果该边连结边界顶点，不进行缝合
+        if len(set(curve_ends) & boundary_geo_pnt) != 0:
+            geo_edge_involve_boundary_pnt.add(key)
             continue
         # 验证该边的属性
         geo_faces = geo.edge_to_surface[key]
@@ -665,8 +694,6 @@ if stitch_mesh:
         if len(geo_faces) > 2:
             print(key, "非流形边，暂不处理")
             continue
-        # 边的端点
-        curve_ends = value.end_pnt_index
         # 找到该边处所有跨面的网格
         curve_first_mesh_face = list(geo_vert_to_mesh_faces[curve_ends[0]])
         # 顶点处可能存在多个备选的网格面,选择横跨这条边的面
@@ -697,6 +724,7 @@ if stitch_mesh:
         # 在公共边上增加网格点
         current_edge_new_pnt = []
         current_edge_new_pnt = current_edge_new_pnt + [geo_vert_to_mesh_pnt[curve_ends[0]]]
+
         for common in common_edge[1::2]:
             p1 = My_mesh.verts[common[0]]
             p2 = My_mesh.verts[common[1]]
@@ -712,6 +740,7 @@ if stitch_mesh:
                 new_mesh_pnt_id = My_mesh.add_vertex(new_pnt_xyz)
                 current_edge_new_pnt.append(new_mesh_pnt_id)
         current_edge_new_pnt = current_edge_new_pnt + [geo_vert_to_mesh_pnt[curve_ends[1]]]
+        fixed_boundary_mesh_pnt.update(current_edge_new_pnt)
         # 将两个面中的点进行缝合
         for i in range(2):
             current_face_related_mesh = edge_related_mesh_in_each_face[i]
@@ -747,6 +776,8 @@ if stitch_mesh:
                         My_mesh.add_face(current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2])
     # 处理顶点在面上存在多个对应点的情况
     for geo_pnt_key, value1 in geo_vert_to_mesh_pnt_in_geo_face.items():
+        if geo_pnt_key in boundary_geo_pnt:
+            continue
         for geo_face_key, value2 in value1.items():
             # 该处存在网格缺失，补足
             value = list(value2)
@@ -758,37 +789,41 @@ if stitch_mesh:
     # 处理连续的边，其在顶点位置连接其他不连续边，存在的网格缺失情况
     for key, value in geo.edges.items():
         # 验证是否连续
-        if not value.is_continuity:
-            continue
-        # 边的端点
-        curve_ends = value.end_pnt_index
-        # 相关面
-        geo_faces = geo.edge_to_surface[key]
-        # 处理端点
-        for end in curve_ends:
-            # 验证该边端点是否对应了网格顶点
-            if end in geo_vert_to_mesh_pnt:
-                # 第一个点为网格点
-                new_tris = {geo_vert_to_mesh_pnt[end]}
-                # 找到该点处所有跨面的网格
-                current_mesh_faces = list(geo_vert_to_mesh_faces[end])
-                for face_indx in geo_faces:
-                    for mesh_face_indx in current_mesh_faces:
-                        tmp = find_tri_in_face(geo, new_mesh_face, face_indx, mesh_face_indx)
-                        if len(tmp) != 0 and tmp[0]not in new_tris:
-                            for v in tmp:
-                                new_tris.add(v)
-                new_tris = list(new_tris)
-                if len(new_tris) == 3:
-                    My_mesh.add_face(new_tris[0], new_tris[1], new_tris[2])
-                elif len(new_tris) == 4:
-                    sort_tris = sort_quad_points(My_mesh.faces, new_tris)
-                    add_mesh_face_with_4_pnts(My_mesh, sort_tris[0], sort_tris[1], sort_tris[2], sort_tris[3])
+        if value.is_continuity or key in geo_edge_involve_boundary_pnt:
+            # 边的端点
+            curve_ends = value.end_pnt_index
+            # 相关面
+            geo_faces = geo.edge_to_surface[key]
+            # 处理端点
+            for end in curve_ends:
+                if end in boundary_geo_pnt:
+                    continue
+                # 验证该边端点是否对应了网格顶点
+                if end in geo_vert_to_mesh_pnt:
+                    # 第一个点为网格点
+                    new_tris = {geo_vert_to_mesh_pnt[end]}
+                    # 找到该点处所有跨面的网格
+                    current_mesh_faces = list(geo_vert_to_mesh_faces[end])
+                    for face_indx in geo_faces:
+                        for mesh_face_indx in current_mesh_faces:
+                            tmp = find_tri_in_face(geo, new_mesh_face, face_indx, mesh_face_indx)
+                            if len(tmp) != 0 and tmp[0]not in new_tris:
+                                for v in tmp:
+                                    new_tris.add(v)
+                    new_tris = list(new_tris)
+                    if len(new_tris) == 3:
+                        My_mesh.add_face(new_tris[0], new_tris[1], new_tris[2])
+                    elif len(new_tris) == 4:
+                        sort_tris = sort_quad_points(My_mesh.faces, new_tris)
+                        add_mesh_face_with_4_pnts(My_mesh, sort_tris[0], sort_tris[1], sort_tris[2], sort_tris[3])
+                    else:
+                        print("连续的边端点补充顶点大于4，需要检查问题")
 
 
     My_mesh.compact()
     new_mesh_pnt, new_mesh_face = My_mesh.to_meshes()
 
+# 网格优化
 
 # # 边界点用路径点
 # path = []
