@@ -1,14 +1,18 @@
 import aspose.threed as a3d
 import torch
 import numpy as np
-
+import Loss
 import Draw
 import Myio
 import MyGeometry
 from collections import defaultdict, deque, Counter
-
+from pytorch3d.structures.meshes import Meshes
+from pytorch3d.loss import mesh_normal_consistency
+from pytorch3d.loss import mesh_edge_loss
+from pytorch3d.loss import mesh_laplacian_smoothing
 
 stitch_mesh = True
+optimize_mesh = True
 
 # 新增1 动态删除网格 2025.4.7 √
 # 新增2 新增边界点与原网格点过近 2025.4.7 √
@@ -17,7 +21,8 @@ stitch_mesh = True
 # BUG:3. 跨面网格跨非连续的面，网格缝合与网格删除均存在问题 2025.4.8 √
 # BUG:4. 顶点处连接多条边（大于4）可能出现缝合不准确 2025.4.8 √
 # 新增3. 脏几何之不连续边界处理    2025.4.10 √
-
+# 新增4. 网格优化    2025.4.14 √
+# BUG:5. 解决网格优化计算时出现nan的bug 2025.4.15 √
 
 def find_neighbors(target, indx):
     """
@@ -106,15 +111,11 @@ def add_mesh_face_with_4_pnts(My_mesh, f1, f2, e2, e1):
     dist1 = torch.norm(mesh_verts[f1] - mesh_verts[e2])
     dist2 = torch.norm(mesh_verts[f2] - mesh_verts[e1])
     if dist1 > dist2:
-        if e1 != f1 and e1 != f2:
-            My_mesh.add_face(f1, f2, e1)
-        if e1 != f2 and e2 != f2:
-            My_mesh.add_face(e1, e2, f2)
+        My_mesh.add_face(f1, f2, e1)
+        My_mesh.add_face(e1, e2, f2)
     else:
-        if f1 != e1 and f1 != e2:
-            My_mesh.add_face(f1, e1, e2)
-        if f1 != e2 and f2 != e2:
-            My_mesh.add_face(f1, f2, e2)
+        My_mesh.add_face(f1, e1, e2)
+        My_mesh.add_face(f1, f2, e2)
 
 def is_triangle_in_faces(faces, i, j, k):
     """
@@ -369,8 +370,8 @@ class DynamicMesh:
 
     def add_face(self, i, j, k):
         """增加网格面，返回id"""
-        self.faces.append([i, j, k])
-        return len(self.faces) - 1
+        if i != j and i != k and j != k:
+            self.faces.append([i, j, k])
 
     def delete_vertex(self, idx):
         """增加网格点标记，后续删除"""
@@ -378,13 +379,10 @@ class DynamicMesh:
 
     def delete_face(self, idx):
         """增加网格面标记，后续删除"""
-        if idx not in self.deleted_face_indices:
-            self.deleted_face_indices.add(idx)
+        self.deleted_face_indices.add(idx)
 
     def delete_list_face(self, index_list):
-        for idx in index_list:
-            if idx not in self.deleted_face_indices:
-                self.deleted_face_indices.add(idx)
+        self.deleted_face_indices.update(index_list)
 
     def compact(self):
         """
@@ -419,6 +417,11 @@ class DynamicMesh:
 
     def to_meshes(self):
         """Export to PyTorch3D Meshes object (single mesh)."""
+        #
+        for face in self.faces:
+            test_face = set(face)
+            if len(test_face) != 3:
+                print("存在面不构成三角形", face)
         verts_tensor = torch.tensor(self.verts, dtype=torch.float32)
         faces_tensor = torch.tensor(self.faces, dtype=torch.int64)
         return verts_tensor, faces_tensor
@@ -537,8 +540,10 @@ new_mesh_face = new_src_mesh.faces_packed()
 # geo.update_mesh_vert_to_face(new_src_mesh)
 
 
-# 记录网格中固定的边界
+# 记录网格中固定的边界点与边界网格边
 fixed_boundary_mesh_pnt = set()
+fixed_boundary_mesh_edge = set()
+
 # 缝合几何特征
 if stitch_mesh:
     # 新建动态网格数组
@@ -553,25 +558,29 @@ if stitch_mesh:
     geo_face_with_boundary_geo_curve = set()
     # 顶点处的网格点
     geo_vert_to_mesh_pnt = defaultdict(set)
-    # 遍历所有几何边，找到不连续的边，增加顶点
+    # 找到边界边
     for key, value in geo.edges.items():
         # 边界边不认为是几何特征
         if len(geo.edge_to_surface[key]) < 2:
             boundary_geo_curve.add(key)
             geo_face_with_boundary_geo_curve.update(value.belong_face_index)
             continue
+    # 找到边界边的顶点
+    for i in boundary_geo_curve:
+        boundary_geo_pnt.update(geo.edges[i].end_pnt_index)
+    # 遍历所有几何边，找到不连续的边，增加顶点，但不管边界边顶点
+    for key, value in geo.edges.items():
         # 不连续需要对该边进行缝合，先增加端点处增加对应的网格点：
         if not value.is_continuity:
             # 添加端点
             for end in value.end_pnt_index:
+                if end in boundary_geo_pnt:
+                    continue
                 # 保证不重复添加
                 if end not in geo_vert_to_mesh_pnt:
                     new_pnt_xyz = geo.vertexs[end].GetPntXYZ()
                     new_mesh_pnt_id = My_mesh.add_vertex(new_pnt_xyz)
                     geo_vert_to_mesh_pnt[end] = new_mesh_pnt_id
-    # 找到边界边的顶点
-    for i in boundary_geo_curve:
-        boundary_geo_pnt.update(geo.edges[i].end_pnt_index)
 
     # 跨几何边的网格面
     geo_edge_to_mesh_faces = defaultdict(set)
@@ -614,11 +623,21 @@ if stitch_mesh:
                     edges_key = geo.faces[face_key].contain_edge_index
                     for edge_key in edges_key:
                         edges_end = edges_end + geo.edges[edge_key].end_pnt_index
-
                 # 找几何边的公共顶点
                 count = Counter(edges_end)
-                most_common_num, _ = count.most_common(1)[0]
-                geo_vert_to_mesh_faces[most_common_num].add(i)
+                max_freq = max(count.values())
+                most_common_elements = [k for k, v in count.items() if v == max_freq]
+                # 如果该顶点为边界点，则不处理
+                found = []
+                for common in most_common_elements:
+                    if common not in boundary_geo_pnt:
+                        found.append(common)
+                if len(found) == 1:
+                    geo_vert_to_mesh_faces[found[0]].add(i)
+                elif len(found) > 1:
+                    geo_vert_to_mesh_faces[found[0]].add(i)
+                    print("网格面所计算出对应的几何顶点超过一个，检查问题")
+
     # 检查
     if len(geo_vert_to_mesh_faces) != len(geo_vert_to_mesh_pnt):
         print("顶点处网格点与顶点处网格面数量不匹配")
@@ -664,10 +683,9 @@ if stitch_mesh:
         if len(other_sublist) != 0:
             print("仍然跨三个几何面的网格顶点为组成联通区域", other_sublist)
             print(extended)
-            print(key)
         geo_vert_to_mesh_faces[key] = extended
     if len(alternative) != 0:
-            print("仍然存在跨不连续几何面的网格面未被处理")
+            print("仍然存在跨不连续几何面的网格面未被匹配, 可能存在于不相接区域", alternative)
     # 删除几何顶点处对应的网格面
     for key, value in geo_vert_to_mesh_faces.items():
         if key not in boundary_geo_pnt:
@@ -740,6 +758,7 @@ if stitch_mesh:
                 new_mesh_pnt_id = My_mesh.add_vertex(new_pnt_xyz)
                 current_edge_new_pnt.append(new_mesh_pnt_id)
         current_edge_new_pnt = current_edge_new_pnt + [geo_vert_to_mesh_pnt[curve_ends[1]]]
+        # 记录边界点
         fixed_boundary_mesh_pnt.update(current_edge_new_pnt)
         # 将两个面中的点进行缝合
         for i in range(2):
@@ -756,11 +775,12 @@ if stitch_mesh:
                     edge_pnt2 = current_edge_new_pnt[j + 1]
                     # 增加网格面
                     add_mesh_face_with_4_pnts(My_mesh, face_pnt1, face_pnt2, edge_pnt2, edge_pnt1)
+                    # 记录边界
+                    fixed_boundary_mesh_edge.add((edge_pnt1, edge_pnt2))
             # 情况2  面上的点比边上的少1，或者2
             elif len(current_face_related_mesh) < len(current_edge_new_pnt):
                 # # 第一个三角面面片
-                if current_face_related_mesh[0] != current_edge_new_pnt[0] and current_face_related_mesh[0] != current_edge_new_pnt[1]:
-                    My_mesh.add_face(current_face_related_mesh[0], current_edge_new_pnt[0], current_edge_new_pnt[1])
+                My_mesh.add_face(current_face_related_mesh[0], current_edge_new_pnt[0], current_edge_new_pnt[1])
                 # 中间的按四个点处理，找出短边作为网格边
                 for j in range(len(current_face_related_mesh) - 1):
                     face_pnt1 = current_face_related_mesh[j]
@@ -772,8 +792,7 @@ if stitch_mesh:
 
                 # 面上的点比边上的点少2个，最后还有一个三角片需要构造
                 if len(current_edge_new_pnt) - len(current_face_related_mesh) == 2:
-                    if current_face_related_mesh[-1] != current_edge_new_pnt[-1] and current_face_related_mesh[-1] != current_edge_new_pnt[-2]:
-                        My_mesh.add_face(current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2])
+                    My_mesh.add_face(current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2])
     # 处理顶点在面上存在多个对应点的情况
     for geo_pnt_key, value1 in geo_vert_to_mesh_pnt_in_geo_face.items():
         if geo_pnt_key in boundary_geo_pnt:
@@ -819,13 +838,67 @@ if stitch_mesh:
                     else:
                         print("连续的边端点补充顶点大于4，需要检查问题")
 
-
     My_mesh.compact()
     new_mesh_pnt, new_mesh_face = My_mesh.to_meshes()
 
-# 网格优化
 
-# # 边界点用路径点
+# 网格优化
+if optimize_mesh:
+    optimize_device = torch.device("cpu")
+    new_mesh = Meshes(verts=[new_mesh_pnt], faces=[new_mesh_face])
+    # 优化权重
+    w_match_edge = 1
+    w_angle = 1
+    w_edge_length = 1  # 0.01
+    w_normal = 0.1
+    w_laplacian = 0.1
+    steps = 200
+    # 损失变化
+    angle_losses = []
+    edge_length_losses = []
+    normal_losses = []
+    laplacian_losses = []
+    # 生成 fixed_mask
+    fixed_mask = torch.zeros(len(new_mesh_pnt), dtype=torch.bool)
+    fixed_mask[list(fixed_boundary_mesh_pnt)] = True
+    optimize_mask = ~fixed_mask
+    #
+    optimize_mesh_pnt_num = len(new_mesh_pnt) - len(fixed_boundary_mesh_pnt)
+    # 优化的偏移量
+    deform_verts = torch.full((optimize_mesh_pnt_num, 3), 0.0, device=optimize_device, requires_grad=True)
+
+    # 生成 optimizer
+    optimizer = torch.optim.Adam([deform_verts], lr=0.01)
+    # 开始优化
+    for step in range(steps):
+        optimizer.zero_grad()
+        all_mesh_deform = torch.full(new_mesh_pnt.shape, 0.0, device=deform_verts.device)
+        #
+        all_mesh_deform[optimize_mask] = deform_verts
+        #
+        optimize_mesh = new_mesh.offset_verts(all_mesh_deform)
+        #
+        # 计算损失函数
+        loss_edge_length = mesh_edge_loss(optimize_mesh)
+        loss_laplacian = mesh_laplacian_smoothing(optimize_mesh, "cot")
+        loss_normal = mesh_normal_consistency(optimize_mesh)
+        loss_angle = Loss.mesh_angle_loss(optimize_mesh, torch.pi / 3)
+
+        total_loss = loss_angle * w_angle + loss_normal * w_normal + loss_laplacian * w_laplacian
+
+        angle_losses.append(float(loss_edge_length.detach().cpu()))
+        angle_losses.append(float(loss_angle.detach().cpu()))
+        normal_losses.append(float(loss_normal.detach().cpu()))
+        laplacian_losses.append(float(loss_laplacian.detach().cpu()))
+        print(step, loss_edge_length, loss_angle, loss_normal, loss_laplacian)
+        total_loss.backward()
+        optimizer.step()
+
+    Draw.plot_final_loss(angle_losses, edge_length_losses, normal_losses,laplacian_losses)
+
+    new_mesh_pnt, new_mesh_face = optimize_mesh.get_mesh_verts_faces(0)
+
+    # # 边界点用路径点
 # path = []
 # for key, value in geo.edges.items():
 #     if not value.is_continuity:

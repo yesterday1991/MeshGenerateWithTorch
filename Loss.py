@@ -119,16 +119,21 @@ def count_mesh_angle(mesh):
     faces_packed = mesh.faces_packed()  # 每个面对应的idx
     verts_packed = mesh.verts_packed()  # 顶点坐标
     verts_faces = verts_packed[faces_packed]  # 每个面的顶点坐标
+
     a, b, c = verts_faces.unbind(1)  # 面三个顶点坐标
     vector_ab = b - a  # 边 向量
     vector_ac = c - a
     vector_bc = c - b
+
     norm_ab = vector_ab.norm(dim=1, p=2)  # 边长度
     norm_ac = vector_ac.norm(dim=1, p=2)
     norm_bc = vector_bc.norm(dim=1, p=2)
+
+    # 计算角度
     A = torch.acos((vector_ab * vector_ac).sum(dim=1) / (norm_ab * norm_ac))  # 角度A
     B = torch.acos((-vector_ab * vector_bc).sum(dim=1) / (norm_ab * norm_bc))  # 角度B
     C = torch.acos((vector_bc * vector_ac).sum(dim=1) / (norm_ac * norm_bc))  # 角度C
+
     return A, B, C
 
 
@@ -139,37 +144,50 @@ def mesh_angle_loss(mesh, angle):
     :param angle:   最优角度
     :return:        损失
     """
+    print("----")
     angle_A, angle_B, angle_C = count_mesh_angle(mesh)
+
     loss = nn.MSELoss()
     target_angle = torch.full(angle_A.shape, angle)
     loss_mean = (loss(angle_A, target_angle) + loss(angle_B, target_angle) + loss(angle_C, target_angle)) / 3
     return loss_mean / torch.pi
 
+def from_mesh_faces_get_edges(faces):
+    """
+    从网格面中获取边
+    :param faces:   网格面
+    :return:        网格边
+    """
 
-def edge_length_loss(mesh):
+    v0, v1, v2 = faces.chunk(3, dim=1)
+    e01 = torch.cat([v0, v1], dim=1)
+    e12 = torch.cat([v1, v2], dim=1)
+    e20 = torch.cat([v2, v0], dim=1)
+    edges = torch.cat([e12, e20, e01], dim=0)
+    return edges
+
+
+
+def edge_length_loss(verts, faces):
     """
     计算网格的边长一致性损失
-    :param mesh:    网格
+    :param mesh:    网格点
+    :param face:    网格面
     :return:        计算损失
     """
-    verts = mesh.verts_packed()  # 获取顶点坐标
-    edges = mesh.edges_packed()  # 获取边的顶点索引
-
+    edges = from_mesh_faces_get_edges(faces)
     # 计算每条边的长度
     v_start, v_end = verts[edges[:, 0]], verts[edges[:, 1]]
     edge_lengths = torch.norm(v_start - v_end, p=2, dim=1)
-
     # 边长一致性损失：最小化边的长度变化（尽可能接近平均边长）
     mean_length = edge_lengths.mean()
     edge_loss = ((edge_lengths - mean_length).pow(2)).mean()
-
     return edge_loss
 
 
-def compute_cotangent_weights(mesh):
+def compute_cotangent_weights(verts, faces):
 
-    verts = mesh.verts_packed()  # 获取顶点
-    faces= mesh.faces_packed() # 获取面
+
     num_verts = verts.shape[0]
     num_faces = faces.shape[0]
     # 计算每条边的cotangent权重
@@ -199,7 +217,7 @@ def compute_cotangent_weights(mesh):
 
 
 
-def laplacian_smoothing_loss(mesh, model):
+def laplacian_smoothing_loss(verts, faces, model=2):
     """
     基于统一矩阵的拉普拉斯平滑损失实现
     :param mesh:  网格
@@ -207,11 +225,9 @@ def laplacian_smoothing_loss(mesh, model):
     :return:      计算损失
     """
 
-    verts = mesh.verts_packed()  # 获取顶点
-    edges = mesh.edges_packed()  # 获取边
-    faces= mesh.faces_packed() # 获取面
+    edges = from_mesh_faces_get_edges(faces)
     num_verts = verts.shape[0]
-    num_faces = faces.shape[0]
+
     # 构建拉普拉斯矩阵
     if model == 1:
         #L[i, j] =    -1       , if i == j
@@ -238,7 +254,7 @@ def laplacian_smoothing_loss(mesh, model):
         loss = torch.sum(laplacian_matrix.mm(verts).norm(dim=1), dim=0) / num_verts
     elif model == 2:
         # 1. 创建邻接矩阵 A
-        adj_matrix = compute_cotangent_weights(mesh)
+        adj_matrix = compute_cotangent_weights(verts, faces)
         #  2. 计算度数矩阵D
         degree = torch.sparse.sum(adj_matrix, dim=1).to_dense().view(-1, 1)
         idx = degree > 0

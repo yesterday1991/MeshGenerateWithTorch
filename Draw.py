@@ -101,15 +101,11 @@ def plot_3_point(points1, points2, points3):
     ax.view_init(190, 30)
     plt.show()
 
-def plot_final_loss(surface_losses, match_edge_losses, angle_losses, edge_length_losses, normal_losses, laplacian_losses):
+def plot_final_loss(*args):
     fig1 = plt.figure(figsize=(13, 5))
     ax1 = fig1.gca()
-    ax1.plot(surface_losses, label="surface_losses")
-    ax1.plot(match_edge_losses, label="match_edge_losses")
-    ax1.plot(angle_losses, label="angle losse")
-    ax1.plot(edge_length_losses, label="edge_length_losses")
-    ax1.plot(normal_losses, label="normal loss")
-    ax1.plot(laplacian_losses, label="laplacian loss")
+    for i, arg in enumerate(args):
+        ax1.plot(arg, label=f"loss{i}")
     ax1.legend(fontsize="16")
     ax1.set_xlabel("Iteration", fontsize="16")
     ax1.set_ylabel("Loss", fontsize="16")
