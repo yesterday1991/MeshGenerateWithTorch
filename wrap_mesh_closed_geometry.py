@@ -1,6 +1,6 @@
+import math
 import aspose.threed as a3d
 import torch
-import numpy as np
 import Loss
 import Draw
 import Myio
@@ -12,7 +12,7 @@ from pytorch3d.loss import mesh_edge_loss
 from pytorch3d.loss import mesh_laplacian_smoothing
 
 stitch_mesh = True
-optimize_mesh = True
+optimize_mesh = False
 
 # 新增1 动态删除网格 2025.4.7 √
 # 新增2 新增边界点与原网格点过近 2025.4.7 √
@@ -384,12 +384,112 @@ class DynamicMesh:
     def delete_list_face(self, index_list):
         self.deleted_face_indices.update(index_list)
 
+    def vertex_replacement(self, old_idx, new_idx):
+        # 将网格面中的old_idx替换为new_idx
+        face_tensor = torch.tensor(self.faces, dtype=torch.int64)
+        face_tensor[face_tensor == old_idx] = new_idx
+        self.faces = face_tensor.tolist()
+        self.compact()
+
+    def find_inner_split_triangles(self):
+        # 建立点到面的映射
+        vertex_to_faces = defaultdict(list)
+        for i, face in enumerate(self.faces):
+            for v in face:
+                vertex_to_faces[v].append(i)
+        # 遍历每个顶点，如果它只属于3个面，并且这三个面可以构成一个大三角形，则删除这三个面，添加一个大三角形
+        for v, fids in vertex_to_faces.items():
+            # 只看参与3个面的点
+            if len(fids) != 3:
+                continue
+            # 确认这三个三角形其他顶点能构成大三角形
+            tri_list = [self.faces[fid] for fid in fids]
+            if all(v in tri for tri in tri_list):
+                outer_vertices = set()
+                for tri in tri_list:
+                    outer_vertices.update(tri)
+                outer_vertices.discard(v)
+                if len(outer_vertices) == 3:
+                    # 删除三个小三角形，构成一个大三角形
+                    outer_vertices_list = list(outer_vertices)
+                    self.delete_list_face(fids)
+                    self.add_face(outer_vertices_list[0], outer_vertices_list[1], outer_vertices_list[2])
+
+    def optimize_face_angele(self, fixed_pnt, fixed_edges, target_angle = math.pi / 9):
+
+        cos_target_angle = torch.cos(torch.tensor(target_angle))
+        for index, face in enumerate(self.faces):
+            # 判断三角形中是否存在边界固定的边
+            current_mesh_face_fix_edge = []
+            for i in range(3):
+                end1 = face[i]
+                end2 = face[(i+1)%3]
+                mesh_edge = tuple(sorted((end1, end2)))
+                if mesh_edge in fixed_edges:
+                    current_mesh_face_fix_edge.append(mesh_edge)
+            # 三角形中包含两条固定边，不进行处理
+            if len(current_mesh_face_fix_edge) >= 2:
+                continue
+            # 判断角度
+            for i in range(3):
+                # 计算∠abc与target的大小
+                a = face[i]
+                b = face[(i + 1) % 3]
+                c = face[(i + 2) % 3]
+                a_xyz = torch.tensor(self.verts[a])
+                b_xyz = torch.tensor(self.verts[b])
+                c_xyz = torch.tensor(self.verts[c])
+                # 向量 ba, bc
+                bc = c_xyz - b_xyz
+                ba = a_xyz - b_xyz
+                # 计算向量长度
+                norm_bc = bc.norm()
+                norm_ba = ba.norm()
+                # 计算cos角度
+                cos_abc = torch.dot(bc, ba) / (norm_bc * norm_ba)
+                # 角度小于指定角度，需要进行调整
+                if cos_abc > cos_target_angle:
+                    # 以边长作为坍缩的指导
+                    ac = c_xyz - a_xyz
+                    norm_ac = ac.norm()
+                    edges_and_length = [
+                        (tuple(sorted((a, b))), norm_ba),
+                        (tuple(sorted((b, c))), norm_bc),
+                        (tuple(sorted((c, a))), norm_ac)
+                    ]
+                    short_edge_order = min(edges_and_length, key=lambda x: x[1])
+                    # 网格中没有固定边
+                    if len(current_mesh_face_fix_edge) == 0:
+                        end1, end2 = short_edge_order[0]
+                        if end1 in fixed_pnt and end2 not in fixed_pnt:
+                            self.vertex_replacement(end2, end1)
+                        elif end2 in fixed_pnt and end1 not in fixed_pnt:
+                            self.vertex_replacement(end1, end2)
+                        elif end1 not in fixed_pnt and end2 not in fixed_pnt:
+                            self.vertex_replacement(end2, end1)
+                        else:
+                            print("网格坍缩时，在最短边中的两个端点均为固定点", end1, end2)
+                    elif len(current_mesh_face_fix_edge) == 1:
+                        all_pnt = set(face)
+                        remaining = (all_pnt - set(current_mesh_face_fix_edge[0])).pop()
+                        dist1 = torch.norm(torch.tensor(self.verts[remaining]) - torch.tensor(self.verts[current_mesh_face_fix_edge[0][0]]))
+                        dist2 = torch.norm(torch.tensor(self.verts[remaining]) - torch.tensor(self.verts[current_mesh_face_fix_edge[0][1]]))
+                        if dist1 < dist2:
+                            self.vertex_replacement(remaining, current_mesh_face_fix_edge[0][0])
+                        else:
+                            self.vertex_replacement(remaining, current_mesh_face_fix_edge[0][1])
+
+
     def compact(self):
         """
         重建网格:
         - 移除标记中的网格点与网格面.
         - 重建网格面中的id以匹配新的网格点数组.
         """
+        # 找到不能构成三角形的面
+        duplicate_rows = [i for i, row in enumerate(self.faces) if len(set(row)) < 3]
+        self.deleted_face_indices.update(duplicate_rows)
+
         index_map = {}  # old_index -> new_index
         new_verts = []
 
@@ -776,11 +876,12 @@ if stitch_mesh:
                     # 增加网格面
                     add_mesh_face_with_4_pnts(My_mesh, face_pnt1, face_pnt2, edge_pnt2, edge_pnt1)
                     # 记录边界
-                    fixed_boundary_mesh_edge.add((edge_pnt1, edge_pnt2))
+                    fixed_boundary_mesh_edge.add(tuple(sorted((edge_pnt1, edge_pnt2))))
             # 情况2  面上的点比边上的少1，或者2
             elif len(current_face_related_mesh) < len(current_edge_new_pnt):
-                # # 第一个三角面面片
+                # 第一个三角面面片
                 My_mesh.add_face(current_face_related_mesh[0], current_edge_new_pnt[0], current_edge_new_pnt[1])
+                fixed_boundary_mesh_edge.add(tuple(sorted((current_edge_new_pnt[0], current_edge_new_pnt[1]))))
                 # 中间的按四个点处理，找出短边作为网格边
                 for j in range(len(current_face_related_mesh) - 1):
                     face_pnt1 = current_face_related_mesh[j]
@@ -789,10 +890,11 @@ if stitch_mesh:
                     edge_pnt2 = current_edge_new_pnt[j + 2]
                     # 增加网格面
                     add_mesh_face_with_4_pnts(My_mesh, face_pnt1, face_pnt2, edge_pnt2, edge_pnt1)
-
+                    fixed_boundary_mesh_edge.add(tuple(sorted((edge_pnt1, edge_pnt2))))
                 # 面上的点比边上的点少2个，最后还有一个三角片需要构造
                 if len(current_edge_new_pnt) - len(current_face_related_mesh) == 2:
                     My_mesh.add_face(current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2])
+                    fixed_boundary_mesh_edge.add(tuple(sorted((current_edge_new_pnt[-1], current_edge_new_pnt[-2]))))
     # 处理顶点在面上存在多个对应点的情况
     for geo_pnt_key, value1 in geo_vert_to_mesh_pnt_in_geo_face.items():
         if geo_pnt_key in boundary_geo_pnt:
@@ -837,10 +939,12 @@ if stitch_mesh:
                         add_mesh_face_with_4_pnts(My_mesh, sort_tris[0], sort_tris[1], sort_tris[2], sort_tris[3])
                     else:
                         print("连续的边端点补充顶点大于4，需要检查问题")
-
+    # My_mesh.compact()
+    # My_mesh.find_inner_split_triangles()
+    # My_mesh.compact()
+    # My_mesh.optimize_face_angele(fixed_boundary_mesh_pnt, fixed_boundary_mesh_edge)
     My_mesh.compact()
     new_mesh_pnt, new_mesh_face = My_mesh.to_meshes()
-
 
 # 网格优化
 if optimize_mesh:
@@ -896,7 +1000,10 @@ if optimize_mesh:
 
     Draw.plot_final_loss(angle_losses, edge_length_losses, normal_losses,laplacian_losses)
 
-    new_mesh_pnt, new_mesh_face = optimize_mesh.get_mesh_verts_faces(0)
+    new_mesh_pnt = torch.Tensor(MyGeometry.project_mesh_to_geo(optimize_mesh, geo))
+
+    _, new_mesh_face = optimize_mesh.get_mesh_verts_faces(0)
+
 
     # # 边界点用路径点
 # path = []
