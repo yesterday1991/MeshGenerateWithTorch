@@ -10,9 +10,10 @@ from pytorch3d.structures.meshes import Meshes
 from pytorch3d.loss import mesh_normal_consistency
 from pytorch3d.loss import mesh_edge_loss
 from pytorch3d.loss import mesh_laplacian_smoothing
+import networkx as nx
 
 stitch_mesh = True
-optimize_mesh = False
+optimize_mesh = True
 
 # 新增1 动态删除网格 2025.4.7 √
 # 新增2 新增边界点与原网格点过近 2025.4.7 √
@@ -23,6 +24,8 @@ optimize_mesh = False
 # 新增3. 脏几何之不连续边界处理    2025.4.10 √
 # 新增4. 网格优化    2025.4.14 √
 # BUG:5. 解决网格优化计算时出现nan的bug 2025.4.15 √
+# 新增5. 坍塌存在极小内角网格单元
+# BUG:6. 顶点在某一个面上的网格顶点数为2但两个网格点并不相连 2025.4.15 √
 
 def find_neighbors(target, indx):
     """
@@ -38,27 +41,6 @@ def find_neighbors(target, indx):
             next_num = target[i + 1] if i < len(target) - 1 else None # 后一个数字
     return prev_num, next_num
 
-
-def edge_exists(faces, v1, v2):
-    """
-    判断网格中是否存在边v1, v2
-    :param faces:  网格面
-    :param v1:    点1
-    :param v2:    点2
-    :return:      True or False
-    """
-    v1, v2 = min(v1, v2), max(v1, v2)  # 统一顺序
-    # 逐个检查三角形的边
-    edge_mask = (
-            ((faces[:, 0] == v1) & (faces[:, 1] == v2)) |
-            ((faces[:, 1] == v1) & (faces[:, 2] == v2)) |
-            ((faces[:, 2] == v1) & (faces[:, 0] == v2)) |
-            ((faces[:, 0] == v2) & (faces[:, 1] == v1)) |
-            ((faces[:, 1] == v2) & (faces[:, 2] == v1)) |
-            ((faces[:, 2] == v2) & (faces[:, 0] == v1))
-    )
-
-    return edge_mask.any().item()
 
 def delete_face(face, i, j, k):
     """
@@ -333,24 +315,6 @@ def find_cross_curve_mesh_face(curve_mesh_face, all_mesh_face, geo_faces):
             find_face = mesh_face
     return find_face
 
-def sort_quad_points(faces, points):
-    """
-    使用四个点之间的距离来找到最长的对角线，从而排序四个点。
-    :param faces:   网格面
-    :param points:  排序点
-    :return:
-    """
-    faces = torch.tensor(faces)
-    # 没有相连的边为对角线
-    for i in range(4):
-        for j in range(i + 1, 4):
-            if not edge_exists(faces, points[i], points[j]):
-                p1, p2 = points[i],  points[j]
-
-    remaining_points = [point for point in points if point != p1 and point != p2]
-
-    return [p1, remaining_points[0], p2, remaining_points[1]]
-
 
 class DynamicMesh:
     def __init__(self, verts_list, faces_list):
@@ -358,6 +322,8 @@ class DynamicMesh:
         self.faces = faces_list  # List of [i, j, k]
         self.deleted_vert_indices = set()
         self.deleted_face_indices = set()
+        self.edge = []
+        self.graph = nx.Graph()
 
     def modify_vert_xyz(self, idx, new_xyz):
         """修改顶点坐标"""
@@ -382,9 +348,51 @@ class DynamicMesh:
         self.deleted_face_indices.add(idx)
 
     def delete_list_face(self, index_list):
+        """增加网格面标记，后续删除"""
         self.deleted_face_indices.update(index_list)
 
+    def get_edges_from_faces(self):
+        """
+        获取所有的网格边
+        """
+        edges = set()
+        for face in self.faces:
+            a, b, c = face
+            # 添加三条边（无向边，按排序处理）
+            edges.add(tuple(sorted((a, b))))
+            edges.add(tuple(sorted((b, c))))
+            edges.add(tuple(sorted((c, a))))
+        self.edge = list(edges)
+
+
+    def from_mesh_create_graph(self):
+        """
+        从网格创建图
+        """
+        for i in range(len(self.verts)):
+            self.graph.add_node(i)
+        # 添加边
+        if len(self.edge) == 0:
+            self.get_edges_from_faces()
+        for i in self.edge:
+            v1 = list(i)[0]
+            v2 = list(i)[1]
+            v1_xyz = torch.tensor(self.verts[v1])
+            v2_xyz = torch.tensor(self.verts[v2])
+            edge_length = torch.norm(v1_xyz - v2_xyz).item()
+            self.graph.add_edge(v1, v2, weight=edge_length)
+
+    def shortest_path_with_2_mesh_pnt(self, p1, p2):
+        """
+        找到两个网格点之间的最短路径
+        :return:  最短路径
+        """
+        self.from_mesh_create_graph()
+        path = nx.dijkstra_path(self.graph, p1, p2)
+        return path
+
     def vertex_replacement(self, old_idx, new_idx):
+        """顶点替换, 用于网格坍塌"""
         # 将网格面中的old_idx替换为new_idx
         face_tensor = torch.tensor(self.faces, dtype=torch.int64)
         face_tensor[face_tensor == old_idx] = new_idx
@@ -479,6 +487,34 @@ class DynamicMesh:
                         else:
                             self.vertex_replacement(remaining, current_mesh_face_fix_edge[0][1])
 
+    def edge_exists(self, v1, v2):
+        """
+        判断网格中是否存在边v1, v2
+        :param v1:    点1
+        :param v2:    点2
+        :return:      True or False
+        """
+        current_edge = tuple(sorted((v1, v2)))
+        if len(self.edge) == 0:
+            self.get_edges_from_faces()
+        return current_edge in self.edge
+
+    def sort_quad_points(self, points):
+        """
+        在网格中的四个点中找到不构成边的点，从而排序四个点。
+        :param faces:   网格面
+        :param points:  排序点
+        :return:
+        """
+        # 没有相连的边为对角线
+        for i in range(4):
+            for j in range(i + 1, 4):
+                if not self.edge_exists(points[i], points[j]):
+                    p1, p2 = points[i], points[j]
+
+        remaining_points = [point for point in points if point != p1 and point != p2]
+
+        return [p1, remaining_points[0], p2, remaining_points[1]]
 
     def compact(self):
         """
@@ -489,17 +525,19 @@ class DynamicMesh:
         # 找到不能构成三角形的面
         duplicate_rows = [i for i, row in enumerate(self.faces) if len(set(row)) < 3]
         self.deleted_face_indices.update(duplicate_rows)
-
+        # 移除网格边
+        self.edge = []
+        # 清除图
+        self.graph = nx.Graph()
+        # 开始处理删除
         index_map = {}  # old_index -> new_index
         new_verts = []
-
         # Rebuild vertex list
         for old_idx, v in enumerate(self.verts):
             if old_idx not in self.deleted_vert_indices:
                 new_idx = len(new_verts)
                 index_map[old_idx] = new_idx
                 new_verts.append(v)
-
         # Rebuild face list with updated indices
         new_faces = []
         for face_idx, face in enumerate(self.faces):
@@ -508,7 +546,6 @@ class DynamicMesh:
             # Check if all vertices of the face are valid
             if all(v_idx in index_map for v_idx in face):
                 new_faces.append([index_map[v] for v in face])
-
         # Replace old data
         self.verts = new_verts
         self.faces = new_faces
@@ -526,10 +563,7 @@ class DynamicMesh:
         faces_tensor = torch.tensor(self.faces, dtype=torch.int64)
         return verts_tensor, faces_tensor
 
-
-
-
-verts, faces = Myio.read_obj("final_model_test.obj")
+verts, faces = Myio.read_obj("final_model_test_d.obj")
 verts = torch.tensor(verts, dtype=torch.float32)
 faces = torch.tensor(faces, dtype=torch.int64)
 
@@ -895,7 +929,9 @@ if stitch_mesh:
                 if len(current_edge_new_pnt) - len(current_face_related_mesh) == 2:
                     My_mesh.add_face(current_face_related_mesh[-1], current_edge_new_pnt[-1], current_edge_new_pnt[-2])
                     fixed_boundary_mesh_edge.add(tuple(sorted((current_edge_new_pnt[-1], current_edge_new_pnt[-2]))))
-    # 处理顶点在面上存在多个对应点的情况
+    # 整理网格
+    My_mesh.compact()
+    # # 处理顶点在面上存在多个对应点的情况
     for geo_pnt_key, value1 in geo_vert_to_mesh_pnt_in_geo_face.items():
         if geo_pnt_key in boundary_geo_pnt:
             continue
@@ -903,10 +939,16 @@ if stitch_mesh:
             # 该处存在网格缺失，补足
             value = list(value2)
             if len(value2) == 2:
-                My_mesh.add_face(value[0], value[1], geo_vert_to_mesh_pnt[geo_pnt_key])
+                if not My_mesh.edge_exists(value[0], value[1]):
+                    shortest_path = My_mesh.shortest_path_with_2_mesh_pnt(value[0], value[1])
+                    for i in range(len(shortest_path) -1):
+                        My_mesh.add_face(shortest_path[i], shortest_path[i + 1], geo_vert_to_mesh_pnt[geo_pnt_key])
+                else:
+                    My_mesh.add_face(value[0], value[1], geo_vert_to_mesh_pnt[geo_pnt_key])
             elif len(value2) > 2:
                 print("顶点在面上存在多个对应点的情况，且顶点数量大于2，需要检查问题")
-
+    # 整理网格
+    My_mesh.compact()
     # 处理连续的边，其在顶点位置连接其他不连续边，存在的网格缺失情况
     for key, value in geo.edges.items():
         # 验证是否连续
@@ -935,14 +977,14 @@ if stitch_mesh:
                     if len(new_tris) == 3:
                         My_mesh.add_face(new_tris[0], new_tris[1], new_tris[2])
                     elif len(new_tris) == 4:
-                        sort_tris = sort_quad_points(My_mesh.faces, new_tris)
+                        sort_tris = My_mesh.sort_quad_points(new_tris)
                         add_mesh_face_with_4_pnts(My_mesh, sort_tris[0], sort_tris[1], sort_tris[2], sort_tris[3])
                     else:
                         print("连续的边端点补充顶点大于4，需要检查问题")
-    # My_mesh.compact()
-    # My_mesh.find_inner_split_triangles()
-    # My_mesh.compact()
-    # My_mesh.optimize_face_angele(fixed_boundary_mesh_pnt, fixed_boundary_mesh_edge)
+    My_mesh.compact()
+    My_mesh.find_inner_split_triangles()
+    My_mesh.compact()
+    My_mesh.optimize_face_angele(fixed_boundary_mesh_pnt, fixed_boundary_mesh_edge)
     My_mesh.compact()
     new_mesh_pnt, new_mesh_face = My_mesh.to_meshes()
 
